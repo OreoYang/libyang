@@ -41,22 +41,6 @@
 #include "xpath.h"
 
 /**
- * @brief Check validation error taking into account multi-error validation.
- *
- * @param[in] r Local return value.
- * @param[in] err_cmd Command to perform on any error.
- * @param[in] val_opts Validation options.
- * @param[in] label Label to go to on fatal error.
- */
-#define LY_VAL_ERR_GOTO(r, err_cmd, val_opts, label) \
-        if (r) { \
-            err_cmd; \
-            if ((r != LY_EVALID) || !(val_opts & LYD_VALIDATE_MULTI_ERROR)) { \
-                goto label; \
-            } \
-        }
-
-/**
  * @brief Callback for freeing getnext HT values.
  */
 static void
@@ -1517,20 +1501,7 @@ cleanup:
     return ret;
 }
 
-/**
- * @brief Validate data siblings based on generic schema node restrictions, recursively for schema-only nodes.
- *
- * @param[in] first First sibling to search in.
- * @param[in] parent Data parent.
- * @param[in] sparent Schema parent of the nodes to check.
- * @param[in] mod Module of the nodes to check.
- * @param[in] ext Extension instance to use, if relevant.
- * @param[in] val_opts Validation options, see @ref datavalidationoptions.
- * @param[in] int_opts Internal parser options.
- * @param[in,out] getnext_ht Getnext HT to use, new @p sparent is added to it.
- * @return LY_ERR value.
- */
-static LY_ERR
+LY_ERR
 lyd_validate_siblings_schema_r(const struct lyd_node *first, const struct lyd_node *parent,
         const struct lysc_node *sparent, const struct lys_module *mod, const struct lysc_ext_instance *ext,
         uint32_t val_opts, uint32_t int_opts, struct ly_ht *getnext_ht)
@@ -1633,16 +1604,7 @@ lyd_validate_obsolete(const struct lyd_node *node)
     } while (snode && (snode->nodetype & (LYS_CHOICE | LYS_CASE)));
 }
 
-/**
- * @brief Validate must conditions of a data node.
- *
- * @param[in] node Node to validate.
- * @param[in] val_opts Validation options.
- * @param[in] int_opts Internal parser options.
- * @param[in] xpath_options Additional XPath options to use.
- * @return LY_ERR value.
- */
-static LY_ERR
+LY_ERR
 lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_opts, uint32_t xpath_options)
 {
     LY_ERR r, rc = LY_SUCCESS;
@@ -1724,23 +1686,27 @@ cleanup:
 }
 
 /**
- * @brief Perform all remaining validation tasks, the data tree must be final when calling this function.
+ * @brief Whether a scoped final pass leaves this node alone.
  *
- * @param[in] first First sibling.
- * @param[in] parent Data parent.
- * @param[in] sparent Schema parent of the siblings, NULL for top-level siblings.
- * @param[in] mod Module of the siblings, NULL for nested siblings.
- * @param[in] ext Extension instance to use, if relevant.
- * @param[in] val_opts Validation options (@ref datavalidationoptions).
- * @param[in] int_opts Internal parser options.
- * @param[in] must_xp_opts Additional XPath options to use for evaluating "must".
- * @param[in,out] getnext_ht Getnext HT to use.
- * @return LY_ERR value.
+ * Only list and leaf-list instances can be skipped: everything an edit did not touch inside such an instance
+ * is unreachable from constraints outside it, which is exactly what the dependency classification proves.
  */
-static LY_ERR
+static ly_bool
+lyd_val_scope_skip(const struct lyd_val_scope *scope, const struct lyd_node *node)
+{
+    if (!scope || !node->schema) {
+        return 0;
+    }
+    if (!(node->schema->nodetype & (LYS_LIST | LYS_LEAFLIST))) {
+        return 0;
+    }
+    return !ly_set_contains(scope->path, node, NULL);
+}
+
+LY_ERR
 lyd_validate_final_r(struct lyd_node *first, const struct lyd_node *parent, const struct lysc_node *sparent,
         const struct lys_module *mod, const struct lysc_ext_instance *ext, uint32_t val_opts, uint32_t int_opts,
-        uint32_t must_xp_opts, struct ly_ht *getnext_ht)
+        uint32_t must_xp_opts, struct ly_ht *getnext_ht, const struct lyd_val_scope *scope)
 {
     LY_ERR r, rc = LY_SUCCESS;
     const char *innode;
@@ -1750,6 +1716,10 @@ lyd_validate_final_r(struct lyd_node *first, const struct lyd_node *parent, cons
     LY_LIST_FOR(first, node) {
         if (node->flags & LYD_EXT) {
             /* ext instance data should have already been validated */
+            continue;
+        }
+
+        if (lyd_val_scope_skip(scope, node)) {
             continue;
         }
 
@@ -1811,9 +1781,13 @@ next_iter:
             break;
         }
 
-        /* validate all children recursively */
+        if (lyd_val_scope_skip(scope, node)) {
+            continue;
+        }
+
+        /* validate all children recursively; once inside a scope root everything below it is validated */
         r = lyd_validate_final_r(lyd_child(node), node, node->schema, NULL, NULL, val_opts, int_opts, must_xp_opts,
-                getnext_ht);
+                getnext_ht, (scope && ly_set_contains(scope->roots, node, NULL)) ? NULL : scope);
         LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
 
         /* set default for containers */
@@ -1913,7 +1887,7 @@ lyd_validate_node_ext(struct lyd_node *node, struct ly_set *ext_node)
  * @param[in,out] diff Validation diff.
  * @return LY_ERR value.
  */
-static LY_ERR
+LY_ERR
 lyd_validate_subtree(struct lyd_node *root, struct ly_set *node_when, struct ly_set *node_types,
         struct ly_set *meta_types, struct ly_set *ext_node, struct ly_set *ext_val, uint32_t val_opts,
         uint32_t int_opts, struct ly_ht *getnext_ht, struct lyd_node **diff)
@@ -2081,7 +2055,7 @@ lyd_validate(struct lyd_node **tree, const struct lys_module *module, const stru
 
         if (!(val_opts & LYD_VALIDATE_NOT_FINAL)) {
             /* perform final validation that assumes the data tree is final */
-            r = lyd_validate_final_r(*first2, NULL, NULL, mod, NULL, val_opts, 0, 0, getnext_ht);
+            r = lyd_validate_final_r(*first2, NULL, NULL, mod, NULL, val_opts, 0, 0, getnext_ht, NULL);
             LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
         }
 
@@ -2142,7 +2116,7 @@ lyd_validate_ext(struct lyd_node **tree, const struct lysc_ext_instance *ext, ui
 
     if (!(val_opts & LYD_VALIDATE_NOT_FINAL)) {
         /* perform final validation that assumes the data tree is final */
-        r = lyd_validate_final_r(*tree, NULL, NULL, NULL, ext, val_opts, 0, 0, getnext_ht);
+        r = lyd_validate_final_r(*tree, NULL, NULL, NULL, ext, val_opts, 0, 0, getnext_ht, NULL);
         LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
     }
 
@@ -2204,7 +2178,7 @@ lyd_validate_module_final(struct lyd_node *tree, const struct lys_module *module
     LY_CHECK_ERR_GOTO(r, rc = r, cleanup);
 
     /* perform final validation that assumes the data tree is final */
-    r = lyd_validate_final_r(first, NULL, NULL, mod, NULL, val_opts, 0, 0, getnext_ht);
+    r = lyd_validate_final_r(first, NULL, NULL, mod, NULL, val_opts, 0, 0, getnext_ht, NULL);
     LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
 
 cleanup:
@@ -2370,7 +2344,7 @@ _lyd_validate_op(struct lyd_node *op_tree, struct lyd_node *op_node, const struc
 
     /* final validation of all the descendants */
     rc = lyd_validate_final_r(lyd_child(op_node), op_node, op_node->schema, NULL, NULL, 0, int_opts, LYXP_IGNORE_WHEN,
-            getnext_ht);
+            getnext_ht, NULL);
     LY_CHECK_GOTO(rc, cleanup);
 
 cleanup:

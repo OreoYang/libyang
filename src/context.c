@@ -47,6 +47,7 @@
 #include "tree_schema.h"
 #include "tree_schema_free.h"
 #include "tree_schema_internal.h"
+#include "validation_deps.h"
 
 #include "../models/ietf-datastores@2018-02-14.h"
 #include "../models/ietf-inet-types@2013-07-15.h"
@@ -335,6 +336,9 @@ ly_ctx_new(const char *search_dir, uint16_t options, struct ly_ctx **new_ctx)
 
     /* init LYB hash lock */
     pthread_mutex_init(&ctx->lyb_hash_lock, NULL);
+
+    /* init incremental validation dependency index lock */
+    pthread_mutex_init(&ctx->val_deps_lock, NULL);
 
     /* modules list */
     ctx->flags = options;
@@ -1419,6 +1423,10 @@ ly_ctx_destroy(struct ly_ctx *ctx)
 
     /* LYB hash lock */
     pthread_mutex_destroy(&ctx->lyb_hash_lock);
+
+    /* incremental validation dependency indexes */
+    lyd_val_deps_ctx_free(ctx);
+    pthread_mutex_destroy(&ctx->val_deps_lock);
 
     /* context specific plugins */
     ly_set_erase(&ctx->plugins_types, NULL);

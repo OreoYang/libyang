@@ -366,6 +366,17 @@ struct ly_ctx {
     struct ly_ht *leafref_links_ht;   /**< hash table of leafref links between term data nodes */
     struct ly_set plugins_types;      /**< context specific set of type plugins */
     struct ly_set plugins_extensions; /**< contets specific set of extension plugins */
+
+    struct lyd_val_dep_index **val_deps; /**< lazily built per-module constraint dependency indexes used by
+                                           incremental validation */
+    uint32_t val_deps_count;          /**< number of ::ly_ctx.val_deps items */
+    pthread_mutex_t val_deps_lock;    /**< lock for ::ly_ctx.val_deps and ::ly_ctx.val_incr_stats */
+    struct lyd_validate_incr_stats {
+        uint64_t calls;               /**< incremental validation entry points called */
+        uint64_t fallbacks;           /**< of those, the ones that validated the whole module instead */
+        uint64_t scope_roots;         /**< subtrees selected for revalidation across all calls */
+        uint64_t extra_nodes;         /**< nodes revalidated because a cross-instance constraint could have changed */
+    } val_incr_stats;
 };
 
 /**

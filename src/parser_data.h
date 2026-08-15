@@ -525,6 +525,51 @@ LIBYANG_API_DECL LY_ERR lyd_validate_module_final(struct lyd_node *tree, const s
         uint32_t val_opts);
 
 /**
+ * @brief Validate module data incrementally, using an edit diff to skip parts the edit cannot have affected.
+ *
+ * Drop-in replacement for ::lyd_validate_module() that accepts and rejects exactly the same data trees.
+ * Every when, must, leafref and unique of the module is classified by how far the data it reads can reach;
+ * list instances the edit did not touch are skipped only when that classification proves their constraints
+ * cannot have changed. Anything that cannot be proven falls back to a full ::lyd_validate_module().
+ *
+ * Pass @p edit_diff as NULL to validate in full. As with ::lyd_validate_module(), use ::LYD_VALIDATE_NOT_FINAL
+ * and follow up with ::lyd_validate_module_incr_final() when validating several modules.
+ *
+ * @param[in,out] tree Data tree to validate. May be changed by validation, might become NULL.
+ * @param[in] module Module whose data (and schema restrictions) to validate.
+ * @param[in] edit_diff Diff of the change being validated, with yang:operation metadata.
+ * @param[in] val_opts Validation options (@ref datavalidationoptions).
+ * @param[out] diff Optional diff with any changes made by the validation.
+ * @return LY_SUCCESS on success.
+ * @return LY_ERR error on error.
+ */
+LIBYANG_API_DECL LY_ERR lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module,
+        const struct lyd_node *edit_diff, uint32_t val_opts, struct lyd_node **diff);
+
+/**
+ * @brief Finish incremental validation started with ::LYD_VALIDATE_NOT_FINAL.
+ *
+ * @param[in] tree Data tree to validate.
+ * @param[in] module Module whose data (and schema restrictions) to validate.
+ * @param[in] edit_diff Diff of the change being validated, the same one passed to ::lyd_validate_module_incr().
+ * @param[in] val_opts Validation options (@ref datavalidationoptions).
+ * @return LY_SUCCESS on success.
+ * @return LY_ERR error on error.
+ */
+LIBYANG_API_DECL LY_ERR lyd_validate_module_incr_final(struct lyd_node *tree, const struct lys_module *module,
+        const struct lyd_node *edit_diff, uint32_t val_opts);
+
+/**
+ * @brief Read the incremental validation counters.
+ *
+ * @param[in] ctx Context to read, NULL for the totals of the process. A context is dropped and recreated on every
+ * schema change, so only the process totals cover a whole run.
+ * @param[out] calls Incremental validation calls made.
+ * @param[out] fallbacks Of those, the ones that validated the whole module instead.
+ */
+LIBYANG_API_DECL void lyd_validate_incr_stats(const struct ly_ctx *ctx, uint64_t *calls, uint64_t *fallbacks);
+
+/**
  * @brief Validate an RPC/action request, reply, or notification. Only the operation data tree (input/output/notif)
  * is validate, any parents are ignored.
  *

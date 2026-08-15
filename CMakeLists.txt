@@ -160,6 +160,8 @@ set(libsrc
     src/xml.c
     src/xpath.c
     src/validation.c
+    src/validation_deps.c
+    src/validation_incr.c
     ${type_plugins})
 
 set(headers
