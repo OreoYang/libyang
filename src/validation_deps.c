@@ -444,6 +444,97 @@ lyd_val_dep_preds_are_keys(const struct lyxp_expr *expr, const struct ly_set *at
     return 1;
 }
 
+/**
+ * @brief Local name of a NameTest token.
+ */
+static const char *
+lyd_val_dep_nametest_local(const struct lyxp_expr *expr, uint32_t tok, uint32_t *len)
+{
+    const char *name = expr->expr + expr->tok_pos[tok];
+    uint32_t i;
+
+    *len = expr->tok_len[tok];
+    for (i = 0; i < *len; ++i) {
+        if (name[i] == ':') {
+            *len -= i + 1;
+            return name + i + 1;
+        }
+    }
+    return name;
+}
+
+/**
+ * @brief Whether an expression counts nothing but the instances holding the same @p snode value as the instance
+ * it is evaluated on.
+ *
+ * Accepted shape is exactly "count(<path>[<snode> = current()]) <cmp> <number>", where the path is a plain
+ * location path whose only predicate is its last step, and where every node the expression reads lies on the
+ * ancestor chain of @p snode. Together that leaves the value of the validated instance as the expression's only
+ * input besides the tree, so the result can only change when an instance of @p snode holding that value appears
+ * or disappears.
+ */
+static ly_bool
+lyd_val_dep_value_keyed_shape(const struct lyxp_expr *expr, const struct lysc_node *snode, const struct ly_set *atoms)
+{
+    uint32_t end, brack1, i, len;
+    const char *name;
+    ly_bool self = 0;
+
+    if (!expr || !atoms || !(snode->nodetype & LYD_NODE_TERM)) {
+        return 0;
+    }
+
+    /* count( ... ) <cmp> <number> and nothing else */
+    if ((expr->used < 2) || (expr->tokens[0] != LYXP_TOKEN_FUNCNAME) || !lyd_val_dep_tok_is(expr, 0, "count") ||
+            (expr->tokens[1] != LYXP_TOKEN_PAR1)) {
+        return 0;
+    }
+    end = lyd_val_dep_call_end(expr, 0);
+    if ((end < 9) || (end + 3 != expr->used) || (expr->tokens[end] != LYXP_TOKEN_PAR2) ||
+            (expr->tokens[end + 1] != LYXP_TOKEN_OPER_COMP) || (expr->tokens[end + 2] != LYXP_TOKEN_NUMBER)) {
+        return 0;
+    }
+
+    /* the single predicate is the last step of the path: [<name> = current()] */
+    brack1 = end - 7;
+    if ((expr->tokens[brack1] != LYXP_TOKEN_BRACK1) || (expr->tokens[brack1 + 1] != LYXP_TOKEN_NAMETEST) ||
+            (expr->tokens[brack1 + 2] != LYXP_TOKEN_OPER_EQUAL) ||
+            (expr->tokens[brack1 + 3] != LYXP_TOKEN_FUNCNAME) || !lyd_val_dep_tok_is(expr, brack1 + 3, "current") ||
+            (expr->tokens[brack1 + 4] != LYXP_TOKEN_PAR1) || (expr->tokens[brack1 + 5] != LYXP_TOKEN_PAR2) ||
+            (expr->tokens[brack1 + 6] != LYXP_TOKEN_BRACK2)) {
+        return 0;
+    }
+
+    /* everything before it is a plain location path, so there is no other predicate and no other function */
+    for (i = 2; i < brack1; ++i) {
+        if ((expr->tokens[i] != LYXP_TOKEN_OPER_PATH) && (expr->tokens[i] != LYXP_TOKEN_NAMETEST)) {
+            return 0;
+        }
+    }
+
+    /* the predicate compares the constrained node itself */
+    name = lyd_val_dep_nametest_local(expr, brack1 + 1, &len);
+    if ((strlen(snode->name) != len) || strncmp(snode->name, name, len)) {
+        return 0;
+    }
+
+    /* the expression reads only the constrained node and its ancestors, so its node set is selected by nothing
+     * but the compared value */
+    for (i = 0; i < atoms->count; ++i) {
+        if (!atoms->snodes[i]) {
+            continue;
+        }
+        if (!lyd_val_dep_is_ancestor(atoms->snodes[i], snode)) {
+            return 0;
+        }
+        if (atoms->snodes[i] == snode) {
+            self = 1;
+        }
+    }
+
+    return self;
+}
+
 enum lyd_val_dep_class
 lyd_val_dep_classify_expr(const struct lysc_node *ctx_node, const struct lys_module *cur_mod,
         const struct lyxp_expr *expr, const struct lysc_prefix *prefixes, struct ly_set **atoms,
@@ -617,6 +708,42 @@ lyd_val_dep_add(struct lyd_val_dep_index *index, const struct lysc_node *snode, 
 }
 
 /**
+ * @brief Mark the constraint added last as value-keyed.
+ */
+static LY_ERR
+lyd_val_dep_value_keyed_mark(struct lyd_val_dep_index *index, const struct lyxp_expr *cond)
+{
+    uint32_t *vk;
+
+    vk = realloc(index->value_keyed, (index->value_keyed_count + 1) * sizeof *index->value_keyed);
+    if (!vk) {
+        return LY_EMEM;
+    }
+    index->value_keyed = vk;
+    index->value_keyed[index->value_keyed_count++] = index->constraint_count - 1;
+
+    index->constraints[index->constraint_count - 1].cond = cond;
+    index->constraints[index->constraint_count - 1].value_keyed = 1;
+    return LY_SUCCESS;
+}
+
+ly_bool
+lyd_val_deps_value_keyed(const struct lyd_val_dep_index *index, const struct lysc_node *snode,
+        const struct lyxp_expr *cond)
+{
+    const struct lyd_val_constraint *c;
+    uint32_t i;
+
+    for (i = 0; i < index->value_keyed_count; ++i) {
+        c = &index->constraints[index->value_keyed[i]];
+        if ((c->snode == snode) && (c->cond == cond)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief Classify every leafref inside a (possibly union) type.
  */
 static LY_ERR
@@ -703,6 +830,13 @@ lyd_val_dep_add_node(struct lyd_val_dep_index *index, const struct lysc_node *sn
         cls = lyd_val_dep_classify_expr(snode, snode->module, musts[u].cond, musts[u].prefixes,
                 &atom_set, &creation_safe, &unit);
         rc = lyd_val_dep_add(index, snode, LYD_VAL_DEP_MUST, cls, creation_safe, unit, musts[u].cond->expr, atom_set);
+
+        /* an implicit default appears without the edit describing it, so its value could not be recognised as
+         * touched and the constraint has to keep being evaluated on every instance */
+        if (!rc && (cls == LYD_VAL_DEP_BOUNDED) && !lyd_val_dep_is_implicit(snode) &&
+                lyd_val_dep_value_keyed_shape(musts[u].cond, snode, atom_set)) {
+            rc = lyd_val_dep_value_keyed_mark(index, musts[u].cond);
+        }
         ly_set_free(atom_set, NULL);
         LY_CHECK_RET(rc);
     }
@@ -744,6 +878,7 @@ lyd_val_dep_index_free(struct lyd_val_dep_index *index)
     }
     free(index->constraints);
     free(index->nonlocal);
+    free(index->value_keyed);
     ly_set_erase(&index->toplevel_atoms, NULL);
     ly_set_erase(&index->dflt_when, NULL);
     free(index);

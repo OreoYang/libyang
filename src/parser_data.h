@@ -570,6 +570,17 @@ LIBYANG_API_DECL LY_ERR lyd_validate_module_incr_final(struct lyd_node *tree, co
 LIBYANG_API_DECL void lyd_validate_incr_stats(const struct ly_ctx *ctx, uint64_t *calls, uint64_t *fallbacks);
 
 /**
+ * @brief Read the "must" counters of incremental validation.
+ *
+ * Only conditions seen by an incremental validation are counted, a full validation leaves both counters alone.
+ *
+ * @param[in] ctx Context to read, NULL for the totals of the process.
+ * @param[out] evals Conditions evaluated.
+ * @param[out] skips Conditions left unevaluated because the edit could not have violated them.
+ */
+LIBYANG_API_DECL void lyd_validate_incr_must_stats(const struct ly_ctx *ctx, uint64_t *evals, uint64_t *skips);
+
+/**
  * @brief Validate an RPC/action request, reply, or notification. Only the operation data tree (input/output/notif)
  * is validate, any parents are ignored.
  *

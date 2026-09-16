@@ -24,7 +24,9 @@
 struct ly_ctx;
 struct ly_set;
 struct lyd_node;
+struct lyd_val_incr;
 struct lys_module;
+struct lysc_must;
 struct lysc_node;
 
 /**
@@ -52,7 +54,29 @@ struct lysc_node;
 struct lyd_val_scope {
     const struct ly_set *roots;     /**< subtrees to validate in full */
     const struct ly_set *path;      /**< ::lyd_val_scope.roots and all their data ancestors */
+    const struct lyd_val_incr *incr;    /**< edit being validated, used to skip value-keyed "must" conditions
+                                             the edit cannot have violated, NULL to evaluate all of them */
 };
+
+/**
+ * @brief Whether an edit cannot have violated a value-keyed "must" on a specific node.
+ *
+ * @param[in] incr Edit being validated.
+ * @param[in] node Node the condition is attached to.
+ * @param[in] must Condition to evaluate or skip.
+ * @return Whether the condition can be left unevaluated, 0 whenever that cannot be proven.
+ */
+ly_bool lyd_val_incr_must_skip(const struct lyd_val_incr *incr, const struct lyd_node *node,
+        const struct lysc_must *must);
+
+/**
+ * @brief Add to the "must" counters of incremental validation.
+ *
+ * @param[in] ctx Context the conditions belong to.
+ * @param[in] evals Conditions evaluated.
+ * @param[in] skips Conditions left unevaluated by ::lyd_val_incr_must_skip().
+ */
+void lyd_val_incr_must_count(const struct ly_ctx *ctx, uint64_t evals, uint64_t skips);
 
 /**
  * @brief Cached getnext schema nodes stored in a validation HT.
@@ -184,9 +208,12 @@ LY_ERR lyd_validate_siblings_schema_r(const struct lyd_node *first, const struct
  * @param[in] val_opts Validation options.
  * @param[in] int_opts Internal parser options.
  * @param[in] xpath_options Additional XPath options to use.
+ * @param[in] incr Optional edit being validated, lets ::lyd_val_incr_must_skip() leave conditions the edit
+ * cannot have violated unevaluated.
  * @return LY_ERR value.
  */
-LY_ERR lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_opts, uint32_t xpath_options);
+LY_ERR lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_opts, uint32_t xpath_options,
+        const struct lyd_val_incr *incr);
 
 /**
  * @brief Validate the whole data subtree.

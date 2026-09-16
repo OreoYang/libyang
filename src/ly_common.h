@@ -376,6 +376,8 @@ struct ly_ctx {
         uint64_t fallbacks;           /**< of those, the ones that validated the whole module instead */
         uint64_t scope_roots;         /**< subtrees selected for revalidation across all calls */
         uint64_t extra_nodes;         /**< nodes revalidated because a cross-instance constraint could have changed */
+        uint64_t must_evals;          /**< "must" conditions evaluated by incremental validation */
+        uint64_t must_skips;          /**< value-keyed "must" conditions the edit could not have violated */
     } val_incr_stats;
 };
 

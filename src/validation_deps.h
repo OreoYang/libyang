@@ -59,9 +59,20 @@ enum lyd_val_dep_kind {
 struct lyd_val_constraint {
     const struct lysc_node *snode;      /**< node the constraint is attached to */
     const char *expr;                   /**< expression text, not owned */
+    const struct lyxp_expr *cond;       /**< parsed expression, only set for a value-keyed constraint */
     const struct lysc_node **atoms;     /**< NULL-terminated schema nodes the expression reads */
     enum lyd_val_dep_kind kind;
     enum lyd_val_dep_class cls;
+
+    /**
+     * @brief Whether the constraint only counts the instances of ::lyd_val_constraint.snode that share the value
+     * of the instance it is evaluated on.
+     *
+     * Such a constraint reads nothing but one value bucket, so an edit that leaves a bucket alone cannot turn it
+     * from satisfied to violated on any instance holding that value. Recognised shape:
+     * "count(<path>[<snode> = current()]) <cmp> <number>".
+     */
+    ly_bool value_keyed;
 
     /**
      * @brief Whether creating data can never turn this constraint from satisfied to violated.
@@ -94,6 +105,9 @@ struct lyd_val_dep_index {
 
     uint32_t *nonlocal;                 /**< indices of ::LYD_VAL_DEP_BOUNDED / ::LYD_VAL_DEP_UNBOUNDED constraints */
     uint32_t nonlocal_count;
+
+    uint32_t *value_keyed;              /**< indices of constraints with ::lyd_val_constraint.value_keyed set */
+    uint32_t value_keyed_count;
 
     /**
      * @brief Schema nodes read by a constraint that no list confines.
@@ -139,6 +153,17 @@ enum lyd_val_dep_class lyd_val_dep_classify_expr(const struct lysc_node *ctx_nod
  * @return LY_ERR value.
  */
 LY_ERR lyd_val_deps_get(const struct lys_module *mod, const struct lyd_val_dep_index **index);
+
+/**
+ * @brief Whether a specific constraint of a node is value-keyed.
+ *
+ * @param[in] index Dependency index of the node's module.
+ * @param[in] snode Node the constraint is attached to.
+ * @param[in] cond Parsed expression of the constraint.
+ * @return Whether the constraint was classified as value-keyed, see ::lyd_val_constraint.value_keyed.
+ */
+ly_bool lyd_val_deps_value_keyed(const struct lyd_val_dep_index *index, const struct lysc_node *snode,
+        const struct lyxp_expr *cond);
 
 /**
  * @brief Free all cached dependency indexes of a context.

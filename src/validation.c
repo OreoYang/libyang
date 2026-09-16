@@ -1605,7 +1605,8 @@ lyd_validate_obsolete(const struct lyd_node *node)
 }
 
 LY_ERR
-lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_opts, uint32_t xpath_options)
+lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_opts, uint32_t xpath_options,
+        const struct lyd_val_incr *incr)
 {
     LY_ERR r, rc = LY_SUCCESS;
     struct lyxp_set xp_set;
@@ -1613,6 +1614,7 @@ lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_o
     const struct lyd_node *tree;
     const struct lysc_node *schema;
     const char *emsg, *eapptag;
+    uint64_t evals = 0, skips = 0;
     LY_ARRAY_COUNT_TYPE u;
 
     assert((int_opts & (LYD_INTOPT_RPC | LYD_INTOPT_REPLY)) != (LYD_INTOPT_RPC | LYD_INTOPT_REPLY));
@@ -1640,6 +1642,12 @@ lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_o
     tree = lyd_first_sibling(tree);
 
     LY_ARRAY_FOR(musts, u) {
+        if (lyd_val_incr_must_skip(incr, node, &musts[u])) {
+            /* the edit cannot have violated this one on this node */
+            ++skips;
+            continue;
+        }
+        ++evals;
         memset(&xp_set, 0, sizeof xp_set);
 
         /* evaluate must */
@@ -1682,6 +1690,9 @@ lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_o
     }
 
 cleanup:
+    if (incr) {
+        lyd_val_incr_must_count(LYD_CTX(node), evals, skips);
+    }
     return rc;
 }
 
@@ -1694,7 +1705,8 @@ cleanup:
 static ly_bool
 lyd_val_scope_skip(const struct lyd_val_scope *scope, const struct lyd_node *node)
 {
-    if (!scope || !node->schema) {
+    if (!scope || !scope->path || !node->schema) {
+        /* a scope below a root only carries the edit, it does not restrict the traversal */
         return 0;
     }
     if (!(node->schema->nodetype & (LYS_LIST | LYS_LEAFLIST))) {
@@ -1711,6 +1723,10 @@ lyd_validate_final_r(struct lyd_node *first, const struct lyd_node *parent, cons
     LY_ERR r, rc = LY_SUCCESS;
     const char *innode;
     struct lyd_node *node;
+
+    /* everything below a scope root is validated, but the edit is still needed there to skip the "must"
+     * conditions it cannot have violated */
+    const struct lyd_val_scope inner = {.roots = NULL, .path = NULL, .incr = scope ? scope->incr : NULL};
 
     /* validate all restrictions of nodes themselves */
     LY_LIST_FOR(first, node) {
@@ -1761,7 +1777,7 @@ lyd_validate_final_r(struct lyd_node *first, const struct lyd_node *parent, cons
         lyd_validate_obsolete(node);
 
         /* node's musts */
-        if ((r = lyd_validate_must(node, val_opts, int_opts, must_xp_opts))) {
+        if ((r = lyd_validate_must(node, val_opts, int_opts, must_xp_opts, scope ? scope->incr : NULL))) {
             goto next_iter;
         }
 
@@ -1787,7 +1803,7 @@ next_iter:
 
         /* validate all children recursively; once inside a scope root everything below it is validated */
         r = lyd_validate_final_r(lyd_child(node), node, node->schema, NULL, NULL, val_opts, int_opts, must_xp_opts,
-                getnext_ht, (scope && ly_set_contains(scope->roots, node, NULL)) ? NULL : scope);
+                getnext_ht, (scope && scope->path && ly_set_contains(scope->roots, node, NULL)) ? &inner : scope);
         LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
 
         /* set default for containers */
@@ -2340,7 +2356,7 @@ _lyd_validate_op(struct lyd_node *op_tree, struct lyd_node *op_node, const struc
 
     /* perform final validation of the operation/notification */
     lyd_validate_obsolete(op_node);
-    LY_CHECK_GOTO(rc = lyd_validate_must(op_node, 0, int_opts, LYXP_IGNORE_WHEN), cleanup);
+    LY_CHECK_GOTO(rc = lyd_validate_must(op_node, 0, int_opts, LYXP_IGNORE_WHEN, NULL), cleanup);
 
     /* final validation of all the descendants */
     rc = lyd_validate_final_r(lyd_child(op_node), op_node, op_node->schema, NULL, NULL, 0, int_opts, LYXP_IGNORE_WHEN,

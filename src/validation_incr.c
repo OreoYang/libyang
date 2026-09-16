@@ -31,17 +31,47 @@
 #include "validation_deps.h"
 
 /**
+ * @brief Values of one value-keyed node that the edit created, deleted or replaced.
+ *
+ * A value-keyed constraint reads nothing but the instances sharing one value, so only the values listed here can
+ * have changed its result, see ::lyd_val_constraint.value_keyed.
+ */
+struct lyd_val_incr_valset {
+    const struct lysc_node *snode;  /**< value-keyed node the values belong to */
+    const char **vals;              /**< values, borrowed from the edit diff */
+    uint32_t val_count;
+    ly_bool unknown;                /**< the diff touched the node without spelling out its value */
+};
+
+/**
  * @brief Everything the edit diff tells us about what may need revalidating.
  */
 struct lyd_val_incr {
+    const struct lys_module *mod;   /**< module being validated */
+    const struct lyd_val_dep_index *index;  /**< dependency index of ::lyd_val_incr.mod, owned by the context */
     struct ly_set roots;        /**< data subtrees to validate in full */
     struct ly_set path;         /**< ::lyd_val_incr.roots and all their data ancestors */
     struct ly_set extra;        /**< individual nodes outside the scope whose cross-instance constraints
                                      the edit could have changed */
     struct ly_set created;      /**< schema nodes the edit only created */
     struct ly_set modified;     /**< schema nodes the edit deleted or whose value it replaced */
+    struct lyd_val_incr_valset *valsets;    /**< edited values of every value-keyed node the edit touched */
+    uint32_t valset_count;
     ly_bool fallback;           /**< the edit could not be analysed, validate the whole module */
 };
+
+static void
+lyd_val_incr_valsets_erase(struct lyd_val_incr *incr)
+{
+    uint32_t i;
+
+    for (i = 0; i < incr->valset_count; ++i) {
+        free((void *)incr->valsets[i].vals);
+    }
+    free(incr->valsets);
+    incr->valsets = NULL;
+    incr->valset_count = 0;
+}
 
 static void
 lyd_val_incr_erase(struct lyd_val_incr *incr)
@@ -51,6 +81,7 @@ lyd_val_incr_erase(struct lyd_val_incr *incr)
     ly_set_erase(&incr->extra, NULL);
     ly_set_erase(&incr->created, NULL);
     ly_set_erase(&incr->modified, NULL);
+    lyd_val_incr_valsets_erase(incr);
 }
 
 /**
@@ -113,6 +144,177 @@ lyd_val_incr_touch(struct ly_set *set, const struct lysc_node *snode)
         LYSC_TREE_DFS_END(snode, elem);
     }
     return LY_SUCCESS;
+}
+
+/**
+ * @brief Whether @p anc is @p snode or one of its schema ancestors.
+ */
+static ly_bool
+lyd_val_incr_snode_covers(const struct lysc_node *anc, const struct lysc_node *snode)
+{
+    for ( ; snode; snode = lysc_data_parent(snode)) {
+        if (snode == anc) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Value a replaced node held before the edit, if the diff says.
+ */
+static const char *
+lyd_val_incr_orig_value(const struct lyd_node *node)
+{
+    const struct lyd_meta *meta;
+
+    LY_LIST_FOR(node->meta, meta) {
+        if (!strcmp(meta->name, "orig-value") && !strcmp(meta->annotation->module->name, "yang")) {
+            return lyd_get_meta_value(meta);
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Get (adding it first if needed) the value set of a value-keyed node.
+ */
+static LY_ERR
+lyd_val_incr_valset_get(struct lyd_val_incr *incr, const struct lysc_node *snode, struct lyd_val_incr_valset **vs)
+{
+    struct lyd_val_incr_valset *mem;
+    uint32_t i;
+
+    for (i = 0; i < incr->valset_count; ++i) {
+        if (incr->valsets[i].snode == snode) {
+            *vs = &incr->valsets[i];
+            return LY_SUCCESS;
+        }
+    }
+
+    mem = realloc(incr->valsets, (incr->valset_count + 1) * sizeof *incr->valsets);
+    LY_CHECK_RET(!mem, LY_EMEM);
+    incr->valsets = mem;
+
+    *vs = &incr->valsets[incr->valset_count++];
+    memset(*vs, 0, sizeof **vs);
+    (*vs)->snode = snode;
+    return LY_SUCCESS;
+}
+
+/**
+ * @brief Remember one value the edit touched.
+ */
+static LY_ERR
+lyd_val_incr_valset_add(struct lyd_val_incr_valset *vs, const char *val)
+{
+    const char **mem;
+    uint32_t i;
+
+    if (!val) {
+        /* a node the diff carries without a value cannot be told apart from any other */
+        vs->unknown = 1;
+        return LY_SUCCESS;
+    }
+    for (i = 0; i < vs->val_count; ++i) {
+        if (!strcmp(vs->vals[i], val)) {
+            return LY_SUCCESS;
+        }
+    }
+
+    mem = realloc((void *)vs->vals, (vs->val_count + 1) * sizeof *vs->vals);
+    LY_CHECK_RET(!mem, LY_EMEM);
+    vs->vals = mem;
+    vs->vals[vs->val_count++] = val;
+    return LY_SUCCESS;
+}
+
+/**
+ * @brief Collect the values of every value-keyed node a diff node changed.
+ *
+ * A diff node that could hold an instance of a value-keyed node without spelling it out leaves the value set
+ * unusable: the tree may well hold an instance the diff does not describe.
+ */
+static LY_ERR
+lyd_val_incr_values(const struct lyd_val_dep_index *index, const struct lyd_node *diff_node,
+        struct lyd_val_incr *incr)
+{
+    const struct lysc_node *snode;
+    struct lyd_val_incr_valset *vs;
+    const struct lyd_node *elem;
+    const char *orig;
+    ly_bool found;
+    uint32_t i;
+
+    for (i = 0; i < index->value_keyed_count; ++i) {
+        snode = index->constraints[index->value_keyed[i]].snode;
+        if (!lyd_val_incr_snode_covers(diff_node->schema, snode)) {
+            /* nothing of this node can be in the changed subtree */
+            continue;
+        }
+
+        LY_CHECK_RET(lyd_val_incr_valset_get(incr, snode, &vs));
+        if (vs->unknown) {
+            continue;
+        }
+
+        found = 0;
+        LYD_TREE_DFS_BEGIN(diff_node, elem) {
+            if (elem->schema == snode) {
+                found = 1;
+                LY_CHECK_RET(lyd_val_incr_valset_add(vs, lyd_get_value(elem)));
+
+                /* a replaced instance frees its old value, which can make another instance valid */
+                orig = lyd_val_incr_orig_value(elem);
+                if (orig) {
+                    LY_CHECK_RET(lyd_val_incr_valset_add(vs, orig));
+                }
+            }
+            LYD_TREE_DFS_END(diff_node, elem);
+        }
+        if (!found) {
+            vs->unknown = 1;
+        }
+    }
+
+    return LY_SUCCESS;
+}
+
+ly_bool
+lyd_val_incr_must_skip(const struct lyd_val_incr *incr, const struct lyd_node *node, const struct lysc_must *must)
+{
+    const struct lyd_val_incr_valset *vs = NULL;
+    uint32_t i;
+
+    if (!incr || !incr->valset_count || !incr->index || !node->schema) {
+        return 0;
+    }
+
+    for (i = 0; i < incr->valset_count; ++i) {
+        if (incr->valsets[i].snode == node->schema) {
+            vs = &incr->valsets[i];
+            break;
+        }
+    }
+    if (!vs || vs->unknown) {
+        /* the edit may have changed an instance of this node without saying which value it held */
+        return 0;
+    }
+    if (!(node->schema->nodetype & LYD_NODE_TERM) ||
+            !lyd_val_deps_value_keyed(incr->index, node->schema, must->cond)) {
+        return 0;
+    }
+
+    for (i = 0; i < vs->val_count; ++i) {
+        if (!lyd_value_compare((const struct lyd_node_term *)node, vs->vals[i], strlen(vs->vals[i]))) {
+            /* the edit added or removed an instance holding this value, so the count may have changed */
+            return 0;
+        }
+    }
+
+    /* no instance holding this value appeared or disappeared, so the count this instance sees is the one it
+     * was already validated against */
+    return 1;
 }
 
 /**
@@ -231,6 +433,9 @@ lyd_val_incr_collect(const struct lyd_node *tree, const struct lys_module *mod, 
              * read another module's data */
             LY_CHECK_RET(lyd_val_incr_touch((op == LYD_DIFF_OP_CREATE) ? &incr->created : &incr->modified,
                     diter->schema));
+
+            /* collected for every module as well: the same value may be held by data of another module */
+            LY_CHECK_RET(lyd_val_incr_values(index, diter, incr));
 
             if (lyd_owner_module(diter) != mod) {
                 /* only this module's data is being validated */
@@ -414,12 +619,15 @@ lyd_val_incr_analyze(const struct lyd_node *tree, const struct lys_module *mod, 
 
     ly_set_erase(&incr->roots, NULL);
     ly_set_erase(&incr->path, NULL);
+    lyd_val_incr_valsets_erase(incr);
+    incr->mod = mod;
 
     rc = lyd_val_deps_get(mod, &index);
     if (rc) {
         incr->fallback = 1;
         return LY_SUCCESS;
     }
+    incr->index = index;
 
     rc = lyd_val_incr_collect(tree, mod, index, edit_diff, incr);
     LY_CHECK_RET(rc);
@@ -498,6 +706,43 @@ lyd_val_incr_count(const struct ly_ctx *ctx, const struct lyd_val_incr *incr, ly
         lyd_val_incr_glob.extra_nodes += incr->extra.count;
     }
     pthread_mutex_unlock(&lyd_val_incr_glob_lock);
+}
+
+void
+lyd_val_incr_must_count(const struct ly_ctx *ctx, uint64_t evals, uint64_t skips)
+{
+    struct ly_ctx *c = (struct ly_ctx *)ctx;
+
+    if (!evals && !skips) {
+        return;
+    }
+
+    pthread_mutex_lock(&c->val_deps_lock);
+    c->val_incr_stats.must_evals += evals;
+    c->val_incr_stats.must_skips += skips;
+    pthread_mutex_unlock(&c->val_deps_lock);
+
+    pthread_mutex_lock(&lyd_val_incr_glob_lock);
+    lyd_val_incr_glob.must_evals += evals;
+    lyd_val_incr_glob.must_skips += skips;
+    pthread_mutex_unlock(&lyd_val_incr_glob_lock);
+}
+
+LIBYANG_API_DEF void
+lyd_validate_incr_must_stats(const struct ly_ctx *ctx, uint64_t *evals, uint64_t *skips)
+{
+    struct ly_ctx *c = (struct ly_ctx *)ctx;
+    pthread_mutex_t *lock = ctx ? &c->val_deps_lock : &lyd_val_incr_glob_lock;
+    const struct lyd_validate_incr_stats *stats = ctx ? &c->val_incr_stats : &lyd_val_incr_glob;
+
+    pthread_mutex_lock(lock);
+    if (evals) {
+        *evals = stats->must_evals;
+    }
+    if (skips) {
+        *skips = stats->must_skips;
+    }
+    pthread_mutex_unlock(lock);
 }
 
 LIBYANG_API_DEF void
@@ -728,11 +973,12 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
 
         scope.roots = &incr.roots;
         scope.path = &incr.path;
+        scope.incr = &incr;
         r = lyd_validate_final_r(*first2, NULL, NULL, module, NULL, val_opts, 0, 0, getnext_ht, &scope);
         LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
 
         for (i = 0; i < incr.extra.count; ++i) {
-            r = lyd_validate_must(incr.extra.dnodes[i], val_opts, 0, 0);
+            r = lyd_validate_must(incr.extra.dnodes[i], val_opts, 0, 0, &incr);
             LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
         }
     }
@@ -787,11 +1033,12 @@ lyd_validate_module_incr_final(struct lyd_node *tree, const struct lys_module *m
 
     scope.roots = &incr.roots;
     scope.path = &incr.path;
+    scope.incr = &incr;
     r = lyd_validate_final_r(first, NULL, NULL, mod, NULL, val_opts, 0, 0, getnext_ht, &scope);
     LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
 
     for (i = 0; i < incr.extra.count; ++i) {
-        r = lyd_validate_must(incr.extra.dnodes[i], val_opts, 0, 0);
+        r = lyd_validate_must(incr.extra.dnodes[i], val_opts, 0, 0, &incr);
         LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
     }
 

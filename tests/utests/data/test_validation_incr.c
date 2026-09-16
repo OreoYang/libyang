@@ -63,6 +63,26 @@ static const char *schema_a =
         "        }\n"
         "    }\n"
         "\n"
+        /* the shared forwarder of bbf-l2-forwarding: a global uniqueness count on a leaf of a doubly nested
+         * list, next to a leafref confined to the outer list instance */
+        "    container fwds {\n"
+        "        list fwd {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            container ports {\n"
+        "                list port {\n"
+        "                    key name;\n"
+        "                    leaf name { type string; }\n"
+        "                    leaf sub-if {\n"
+        "                        type string;\n"
+        "                        must \"count(/a:fwds/a:fwd/a:ports/a:port[a:sub-if = current()]) < 2\";\n"
+        "                    }\n"
+        "                }\n"
+        "            }\n"
+        "            leaf-list flood-port { type leafref { path \"../ports/port/name\"; } }\n"
+        "        }\n"
+        "    }\n"
+        "\n"
         "    container svcs {\n"
         "        list svc {\n"
         "            key name;\n"
@@ -190,23 +210,33 @@ check_edit(void **state, const struct lyd_node *before, const char *path, const 
 }
 
 /**
+ * @brief Remove the single node @p path matches.
+ */
+static void
+drop_node(struct lyd_node **tree, const char *path)
+{
+    struct ly_set *set = NULL;
+
+    assert_int_equal(LY_SUCCESS, lyd_find_xpath(*tree, path, &set));
+    assert_int_equal(1, set->count);
+    if (set->dnodes[0] == *tree) {
+        *tree = (*tree)->next;
+    }
+    lyd_free_tree(set->dnodes[0]);
+    ly_set_free(set, NULL);
+}
+
+/**
  * @brief Delete a node from a duplicate of @p before and check both validators agree on the result.
  */
 static void
 check_delete(void **state, const struct lyd_node *before, const char *path, LY_ERR expected)
 {
     struct lyd_node *after = NULL;
-    struct ly_set *set = NULL;
     LY_ERR rc;
 
     assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
-    assert_int_equal(LY_SUCCESS, lyd_find_xpath(after, path, &set));
-    assert_int_equal(1, set->count);
-    if (set->dnodes[0] == after) {
-        after = after->next;
-    }
-    lyd_free_tree(set->dnodes[0]);
-    ly_set_free(set, NULL);
+    drop_node(&after, path);
 
     check_same(state, before, after, 0, &rc);
     assert_int_equal(expected, rc);
@@ -221,6 +251,18 @@ static const char *base_xml =
         "  </if>"
         "  <if><name>n1</name><alias>a2</alias><type>ani</type><ani-id>7</ani-id></if>"
         "</ifs>"
+        "<fwds xmlns=\"urn:tests:a\">"
+        "  <fwd><name>f1</name>"
+        "    <ports>"
+        "      <port><name>p1</name><sub-if>v1</sub-if></port>"
+        "      <port><name>p2</name><sub-if>v2</sub-if></port>"
+        "    </ports>"
+        "    <flood-port>p1</flood-port>"
+        "  </fwd>"
+        "  <fwd><name>f2</name>"
+        "    <ports><port><name>p3</name><sub-if>v3</sub-if></port></ports>"
+        "  </fwd>"
+        "</fwds>"
         "<svcs xmlns=\"urn:tests:a\">"
         "  <svc><name>s1</name><uses>n1</uses><ref>e1</ref></svc>"
         "</svcs>";
@@ -343,6 +385,142 @@ test_unbounded(void **state)
     lyd_free_siblings(before);
 }
 
+#define PORT_SUB_IF(fwd, port) "/a:fwds/fwd[name='" fwd "']/ports/port[name='" port "']/sub-if"
+
+/**
+ * @brief The global uniqueness count is the one constraint the value-keyed filter skips, so creating a port has
+ * to keep seeing every other port that already holds the value.
+ */
+static void
+test_shared_count_create(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(schema_a, LYS_IN_YANG, NULL, NULL);
+    before = parse_valid(state, base_xml);
+
+    /* a value nobody holds */
+    check_edit(state, before, PORT_SUB_IF("f1", "p9"), "v9", LY_SUCCESS);
+
+    /* a value held by a port of the same forwarder */
+    check_edit(state, before, PORT_SUB_IF("f1", "p9"), "v1", LY_EVALID);
+
+    /* a value held by a port of another forwarder, which no dirty root contains */
+    check_edit(state, before, PORT_SUB_IF("f1", "p9"), "v3", LY_EVALID);
+    check_edit(state, before, PORT_SUB_IF("f2", "p9"), "v1", LY_EVALID);
+
+    lyd_free_siblings(before);
+}
+
+/**
+ * @brief Moving a value has to count as touching both the old and the new one.
+ */
+static void
+test_shared_count_replace(void **state)
+{
+    struct lyd_node *before, *mid = NULL, *after = NULL;
+    LY_ERR rc;
+
+    UTEST_ADD_MODULE(schema_a, LYS_IN_YANG, NULL, NULL);
+    before = parse_valid(state, base_xml);
+
+    /* onto a free value */
+    check_edit(state, before, PORT_SUB_IF("f1", "p1"), "v9", LY_SUCCESS);
+
+    /* onto a value held by the same forwarder, then by another one */
+    check_edit(state, before, PORT_SUB_IF("f1", "p1"), "v2", LY_EVALID);
+    check_edit(state, before, PORT_SUB_IF("f1", "p1"), "v3", LY_EVALID);
+
+    /* freeing a value and reusing it in one edit: only the old value of the moved port makes the reuse legal,
+     * so this passes only if a replaced value counts as touched */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, PORT_SUB_IF("f1", "p1"), "v9",
+            LYD_NEW_PATH_UPDATE, NULL));
+    assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, PORT_SUB_IF("f1", "p2"), "v1",
+            LYD_NEW_PATH_UPDATE, NULL));
+    check_same(state, before, after, 0, &rc);
+    assert_int_equal(LY_SUCCESS, rc);
+    lyd_free_siblings(after);
+    after = NULL;
+
+    /* the same in two edits, so the second one sees a value freed by an earlier apply */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &mid));
+    assert_int_equal(LY_SUCCESS, lyd_new_path(mid, UTEST_LYCTX, PORT_SUB_IF("f2", "p3"), "v9",
+            LYD_NEW_PATH_UPDATE, NULL));
+    check_same(state, before, mid, 0, &rc);
+    assert_int_equal(LY_SUCCESS, rc);
+    check_edit(state, mid, PORT_SUB_IF("f1", "p1"), "v3", LY_SUCCESS);
+
+    lyd_free_siblings(mid);
+    lyd_free_siblings(before);
+}
+
+/**
+ * @brief A deleted value becomes free, while the leafref confined to the forwarder still has to be checked.
+ */
+static void
+test_shared_count_delete(void **state)
+{
+    struct lyd_node *before, *after = NULL;
+    LY_ERR rc;
+
+    UTEST_ADD_MODULE(schema_a, LYS_IN_YANG, NULL, NULL);
+    before = parse_valid(state, base_xml);
+
+    /* an unreferenced port */
+    check_delete(state, before, "/a:fwds/fwd[name='f2']/ports/port[name='p3']", LY_SUCCESS);
+
+    /* a port a flood-port of the same forwarder points at */
+    check_delete(state, before, "/a:fwds/fwd[name='f1']/ports/port[name='p1']", LY_EVALID);
+
+    /* deleting a port frees its value for a port of another forwarder */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    drop_node(&after, "/a:fwds/fwd[name='f1']/ports/port[name='p2']");
+    assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, PORT_SUB_IF("f2", "p9"), "v2",
+            LYD_NEW_PATH_UPDATE, NULL));
+    check_same(state, before, after, 0, &rc);
+    assert_int_equal(LY_SUCCESS, rc);
+    lyd_free_siblings(after);
+    after = NULL;
+
+    /* deleting a whole forwarder frees the values of every port it held */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    drop_node(&after, "/a:fwds/fwd[name='f1']");
+    assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, PORT_SUB_IF("f2", "p9"), "v1",
+            LYD_NEW_PATH_UPDATE, NULL));
+    check_same(state, before, after, 0, &rc);
+    assert_int_equal(LY_SUCCESS, rc);
+    lyd_free_siblings(after);
+
+    lyd_free_siblings(before);
+}
+
+/**
+ * @brief The filter has to actually fire, otherwise the tests above would pass on dead code.
+ */
+static void
+test_shared_count_filter(void **state)
+{
+    struct lyd_node *before;
+    uint64_t evals = 0, skips = 0, evals2 = 0, skips2 = 0;
+
+    UTEST_ADD_MODULE(schema_a, LYS_IN_YANG, NULL, NULL);
+    before = parse_valid(state, base_xml);
+
+    lyd_validate_incr_must_stats(UTEST_LYCTX, &evals, &skips);
+    check_edit(state, before, PORT_SUB_IF("f1", "p9"), "v9", LY_SUCCESS);
+    lyd_validate_incr_must_stats(UTEST_LYCTX, &evals2, &skips2);
+
+    /* the ports holding another value are not re-counted: the two inside the dirty root, which only a filter
+     * reaching below a scope root can skip, and the one the extra pass picked up outside it */
+    assert_true(skips2 - skips >= 3);
+
+    /* and the ones that are counted are still counted */
+    assert_true(evals2 > evals);
+
+    lyd_free_siblings(before);
+}
+
 /**
  * @brief Random edit sequences: whatever the edits are, the incremental verdict must equal the full one.
  */
@@ -364,7 +542,7 @@ test_random_edits(void **state)
         for (step = 0; step < 4; ++step) {
             assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
 
-            switch (rand() % 6) {
+            switch (rand() % 9) {
             case 0:
                 sprintf(path, "/a:ifs/if[name='x%d']/type", rand() % 3);
                 assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, path, types[rand() % 2],
@@ -390,6 +568,28 @@ test_random_edits(void **state)
                 sprintf(value, "a%d", rand() % 3);
                 assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, path, value, LYD_NEW_PATH_UPDATE, NULL));
                 break;
+            case 5:
+                /* drawing from a small pool of values makes duplicates and value moves common */
+                sprintf(path, "/a:fwds/fwd[name='f%d']/ports/port[name='p%d']/sub-if", rand() % 2 + 1, rand() % 4 + 1);
+                sprintf(value, "v%d", rand() % 3 + 1);
+                assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, path, value, LYD_NEW_PATH_UPDATE, NULL));
+                break;
+            case 6:
+            case 7: {
+                struct ly_set *set = NULL;
+
+                if (rand() % 2) {
+                    sprintf(path, "/a:fwds/fwd[name='f%d']/ports/port[name='p%d']", rand() % 2 + 1, rand() % 4 + 1);
+                } else {
+                    sprintf(path, "/a:fwds/fwd[name='f%d']", rand() % 2 + 1);
+                }
+                assert_int_equal(LY_SUCCESS, lyd_find_xpath(after, path, &set));
+                for (i = 0; i < set->count; ++i) {
+                    lyd_free_tree(set->dnodes[i]);
+                }
+                ly_set_free(set, NULL);
+                break;
+            }
             default: {
                 struct ly_set *set = NULL;
 
@@ -513,6 +713,10 @@ main(void)
         UTEST(test_bounded),
         UTEST(test_leafref),
         UTEST(test_unbounded),
+        UTEST(test_shared_count_create),
+        UTEST(test_shared_count_replace),
+        UTEST(test_shared_count_delete),
+        UTEST(test_shared_count_filter),
         UTEST(test_random_edits),
         UTEST(test_toplevel_default),
         UTEST(test_stale_default),
