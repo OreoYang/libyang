@@ -744,7 +744,7 @@ lyd_val_deps_value_keyed(const struct lyd_val_dep_index *index, const struct lys
 }
 
 /**
- * @brief Classify every leafref inside a (possibly union) type.
+ * @brief Classify every leafref inside a (possibly union) type, and flag the module for instance-identifiers.
  */
 static LY_ERR
 lyd_val_dep_add_leafrefs(struct lyd_val_dep_index *index, const struct lysc_node *snode, const struct lysc_type *type)
@@ -772,6 +772,11 @@ lyd_val_dep_add_leafrefs(struct lyd_val_dep_index *index, const struct lysc_node
                 lref->path ? lref->path->expr : "", atom_set);
         ly_set_free(atom_set, NULL);
         return rc;
+    case LY_TYPE_INST:
+        if (((const struct lysc_type_instanceid *)type)->require_instance && (snode->flags & LYS_CONFIG_W)) {
+            index->unanalysable = 1;
+        }
+        return LY_SUCCESS;
     case LY_TYPE_UNION:
         uni = (const struct lysc_type_union *)type;
         LY_ARRAY_FOR(uni->types, u) {

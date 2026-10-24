@@ -126,6 +126,14 @@ struct lyd_val_dep_index {
      */
     struct ly_set dflt_when;
 
+    /**
+     * @brief The module holds a constraint the index cannot describe, so its data is always validated in full.
+     *
+     * Set for a configuration instance-identifier that requires its instance: the target is named by the value,
+     * so no schema atoms say which edits can delete it.
+     */
+    ly_bool unanalysable;
+
     uint32_t class_count[LYD_VAL_DEP_CLASS_COUNT];
 };
 

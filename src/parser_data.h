@@ -530,10 +530,13 @@ LIBYANG_API_DECL LY_ERR lyd_validate_module_final(struct lyd_node *tree, const s
  * Drop-in replacement for ::lyd_validate_module() that accepts and rejects exactly the same data trees.
  * Every when, must, leafref and unique of the module is classified by how far the data it reads can reach;
  * list instances the edit did not touch are skipped only when that classification proves their constraints
- * cannot have changed. Anything that cannot be proven falls back to a full ::lyd_validate_module().
+ * cannot have changed. Anything that cannot be proven falls back to a full ::lyd_validate_module(). That includes
+ * any edit after which the validation deletes a node itself (a when turned false, a default or a case replaced),
+ * because what reads such a node cannot be told from @p edit_diff.
  *
  * Pass @p edit_diff as NULL to validate in full. As with ::lyd_validate_module(), use ::LYD_VALIDATE_NOT_FINAL
- * and follow up with ::lyd_validate_module_incr_final() when validating several modules.
+ * and follow up with ::lyd_validate_module_incr_final() when validating several modules. In that case merge
+ * the @p diff of every module into the edit diff before validating the next module and before the final calls.
  *
  * @param[in,out] tree Data tree to validate. May be changed by validation, might become NULL.
  * @param[in] module Module whose data (and schema restrictions) to validate.
@@ -551,7 +554,8 @@ LIBYANG_API_DECL LY_ERR lyd_validate_module_incr(struct lyd_node **tree, const s
  *
  * @param[in] tree Data tree to validate.
  * @param[in] module Module whose data (and schema restrictions) to validate.
- * @param[in] edit_diff Diff of the change being validated, the same one passed to ::lyd_validate_module_incr().
+ * @param[in] edit_diff Diff of the change being validated, merged with the diffs ::lyd_validate_module_incr()
+ * returned for all the modules. Without them a must reading a node the validation deleted is not rechecked.
  * @param[in] val_opts Validation options (@ref datavalidationoptions).
  * @return LY_SUCCESS on success.
  * @return LY_ERR error on error.

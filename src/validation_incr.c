@@ -623,7 +623,7 @@ lyd_val_incr_analyze(const struct lyd_node *tree, const struct lys_module *mod, 
     incr->mod = mod;
 
     rc = lyd_val_deps_get(mod, &index);
-    if (rc) {
+    if (rc || index->unanalysable) {
         incr->fallback = 1;
         return LY_SUCCESS;
     }
@@ -705,6 +705,23 @@ lyd_val_incr_count(const struct ly_ctx *ctx, const struct lyd_val_incr *incr, ly
         lyd_val_incr_glob.scope_roots += incr->roots.count;
         lyd_val_incr_glob.extra_nodes += incr->extra.count;
     }
+    pthread_mutex_unlock(&lyd_val_incr_glob_lock);
+}
+
+/**
+ * @brief Count a fallback decided after the call was already counted as incremental.
+ */
+static void
+lyd_val_incr_count_late_fallback(const struct ly_ctx *ctx)
+{
+    struct ly_ctx *c = (struct ly_ctx *)ctx;
+
+    pthread_mutex_lock(&c->val_deps_lock);
+    ++c->val_incr_stats.fallbacks;
+    pthread_mutex_unlock(&c->val_deps_lock);
+
+    pthread_mutex_lock(&lyd_val_incr_glob_lock);
+    ++lyd_val_incr_glob.fallbacks;
     pthread_mutex_unlock(&lyd_val_incr_glob_lock);
 }
 
@@ -850,6 +867,51 @@ lyd_val_incr_implicit(struct lyd_node **first2, const struct lys_module *mod, ui
 }
 
 /**
+ * @brief Whether a validation diff deletes any node.
+ */
+static ly_bool
+lyd_val_incr_diff_deletes(const struct lyd_node *val_diff)
+{
+    const struct lyd_node *dtop, *diter;
+    enum lyd_diff_op op;
+
+    LY_LIST_FOR(val_diff, dtop) {
+        LYD_TREE_DFS_BEGIN(dtop, diter) {
+            if (lyd_val_incr_diff_op(diter, &op) && (op == LYD_DIFF_OP_DELETE)) {
+                return 1;
+            }
+            LYD_TREE_DFS_END(dtop, diter);
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Validate the module in full on top of what the incremental passes did so far.
+ *
+ * Every check of the full pass runs on all data again, so starting from a partially validated tree is fine.
+ *
+ * @param[in,out] val_diff Changes made by the validation so far, the changes of the full pass are merged in.
+ */
+static LY_ERR
+lyd_val_incr_full(struct lyd_node **tree, const struct lys_module *module, uint32_t val_opts,
+        struct lyd_node **val_diff)
+{
+    struct lyd_node *full_diff = NULL;
+    LY_ERR r, rc;
+
+    rc = lyd_validate_module(tree, module, val_opts, &full_diff);
+    if (full_diff) {
+        r = lyd_diff_merge_all(val_diff, full_diff, 0);
+        lyd_free_all(full_diff);
+        if (r && !rc) {
+            rc = r;
+        }
+    }
+    return rc;
+}
+
+/**
  * @brief Rebuild the scope against the current tree, giving up on the incremental path if it no longer holds.
  *
  * Every pass that inserts or autodeletes nodes invalidates the collected node pointers.
@@ -862,7 +924,7 @@ lyd_val_incr_implicit(struct lyd_node **first2, const struct lys_module *mod, ui
     LY_CHECK_ERR_GOTO(r, rc = r, cleanup); \
     if (incr.fallback) { \
         lyd_val_incr_count(module->ctx, &incr, 1); \
-        rc = lyd_validate_module(tree, module, val_opts, diff); \
+        rc = lyd_val_incr_full(tree, module, val_opts, &val_diff); \
         goto cleanup; \
     }
 
@@ -875,7 +937,7 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
     struct lyd_val_scope scope;
     struct ly_set node_types = {0}, meta_types = {0}, node_when = {0}, ext_node = {0}, ext_val = {0};
     struct ly_ht *getnext_ht = NULL;
-    struct lyd_node *first, **first2, *iter;
+    struct lyd_node *first, **first2, *iter, *val_diff = NULL;
     uint32_t i, impl_opts;
 
     LY_CHECK_ARG_RET(NULL, tree, module, !(val_opts & LYD_VALIDATE_PRESENT), LY_EINVAL);
@@ -894,7 +956,7 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
 
     if (incr.fallback) {
         lyd_val_incr_count(module->ctx, &incr, 1);
-        rc = lyd_validate_module(tree, module, val_opts, diff);
+        rc = lyd_val_incr_full(tree, module, val_opts, &val_diff);
         goto cleanup;
     }
 
@@ -907,7 +969,7 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
 
     /* the top level is walked in full: it is a single sibling list and everything on it is cheap to check */
     r = lyd_validate_new(first2, *first2 ? lysc_data_parent((*first2)->schema) : NULL, module, NULL, val_opts, 0,
-            getnext_ht, diff);
+            getnext_ht, &val_diff);
     LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
 
     /* autodeletion above may have freed nodes the scope points at, so resolve the diff against the tree again */
@@ -918,7 +980,7 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
             break;
         }
         if (ly_set_contains(&incr.path, iter, NULL) && !ly_set_contains(&incr.roots, iter, NULL)) {
-            r = lyd_val_incr_new_above(iter, &incr, val_opts, getnext_ht, diff);
+            r = lyd_val_incr_new_above(iter, &incr, val_opts, getnext_ht, &val_diff);
             LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
         }
     }
@@ -930,7 +992,7 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
     if (val_opts & LYD_VALIDATE_NO_DEFAULTS) {
         impl_opts |= LYD_IMPLICIT_NO_DEFAULTS;
     }
-    r = lyd_val_incr_implicit(first2, module, impl_opts, getnext_ht, diff);
+    r = lyd_val_incr_implicit(first2, module, impl_opts, getnext_ht, &val_diff);
     LY_CHECK_ERR_GOTO(r, rc = r, cleanup);
 
     /* both passes above rearranged the tree, this is the last chance to build the scope */
@@ -951,7 +1013,7 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
 
     for (i = 0; i < incr.roots.count; ++i) {
         r = lyd_validate_subtree(incr.roots.dnodes[i], &node_when, &node_types, &meta_types, &ext_node, &ext_val,
-                val_opts, 0, getnext_ht, diff);
+                val_opts, 0, getnext_ht, &val_diff);
         LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
     }
 
@@ -963,8 +1025,16 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
     LY_CHECK_ERR_GOTO(r, rc = r, cleanup);
 
     r = lyd_validate_unres(first2, module, LYD_TYPE_DATA_YANG, &node_when, 0, &node_types, &meta_types, &ext_node,
-            &ext_val, val_opts, diff);
+            &ext_val, val_opts, &val_diff);
     LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
+
+    /* a node the validation deleted itself (a when turned false, a default or a case replaced) is not in the edit
+     * diff, so nothing reading it was scheduled for a recheck; only a full pass is sure to see every such reader */
+    if (!rc && lyd_val_incr_diff_deletes(val_diff)) {
+        lyd_val_incr_count_late_fallback(module->ctx);
+        rc = lyd_val_incr_full(tree, module, val_opts, &val_diff);
+        goto cleanup;
+    }
 
     if (!(val_opts & LYD_VALIDATE_NOT_FINAL)) {
         /* "when" resolution above autodeletes, the extra nodes have to be looked up once more */
@@ -984,6 +1054,11 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
     }
 
 cleanup:
+    if (diff) {
+        *diff = val_diff;
+    } else {
+        lyd_free_all(val_diff);
+    }
     ly_set_erase(&node_when, NULL);
     ly_set_erase(&node_types, NULL);
     ly_set_erase(&meta_types, NULL);
