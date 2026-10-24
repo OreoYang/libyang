@@ -1254,10 +1254,9 @@ test_aug_dflt_replace(void **state)
  * @brief The default case is replaced inside a container that only existed as a default.
  *
  * The edit diff does not see default nodes, so it calls the whole b-cfg of x1 created, and the m1-val default that
- * the validation of b then deletes merges away into that create. The must of c-ref/m1need is creation-safe, a
- * created b-cfg cannot make it false, so the final pass of c skips it: incremental accepts what full rejects.
- *
- * Passes with a diff that describes default nodes (LYD_DIFF_DEFAULTS), which is the shape sysrepo produces.
+ * the validation of b then deletes merges away into that create. The must of c-ref/m1need is creation-safe, yet
+ * the created b-cfg replaced a default one, so it must not be skipped. The same holds for an explicit m1-val the
+ * diff calls created while it replaced the default value.
  */
 static void
 test_aug_dflt_case_in_dflt(void **state)
@@ -1265,13 +1264,22 @@ test_aug_dflt_case_in_dflt(void **state)
     struct lyd_node *before, *start;
     const char *setup[] = {"/c:c-refs/c-ref[name='r4']/ifname", "x1", "/c:c-refs/c-ref[name='r4']/m1need", "y",
         NULL, NULL};
+    const char *setup_x1[] = {"/c:c-refs/c-ref[name='r4']/ifname", "x1", "/c:c-refs/c-ref[name='r4']/m1need", "y",
+        "/a:ifs/if[name='x1']/b:b-cfg/speed", "200", NULL, NULL};
     const char *to_m2[] = {"/a:ifs/if[name='x1']/b:b-cfg/m2-val", "5", NULL, NULL};
+    const char *m1_2[] = {"/a:ifs/if[name='x1']/b:b-cfg/m1-val", "2", NULL, NULL};
 
     aug_setup(state);
     before = parse_valid(state, aug_xml);
     start = aug_start(state, before, setup);
 
     aug_check_multi(state, start, to_m2, LY_EVALID);
+    aug_check_multi(state, start, m1_2, LY_EVALID);
+    lyd_free_siblings(start);
+
+    /* b-cfg is explicit, only the leaf replaces its default */
+    start = aug_start(state, before, setup_x1);
+    aug_check_multi(state, start, m1_2, LY_EVALID);
 
     lyd_free_siblings(start);
     lyd_free_siblings(before);

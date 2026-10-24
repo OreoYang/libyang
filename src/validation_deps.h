@@ -174,6 +174,15 @@ ly_bool lyd_val_deps_value_keyed(const struct lyd_val_dep_index *index, const st
         const struct lyxp_expr *cond);
 
 /**
+ * @brief Whether a node can appear in the data without anyone asking for it.
+ *
+ * @param[in] snode Schema node to check.
+ * @return Whether its instance can be an implicit default (a non-presence container, a leaf or leaf-list with a
+ * default).
+ */
+ly_bool lyd_val_deps_is_implicit(const struct lysc_node *snode);
+
+/**
  * @brief Free all cached dependency indexes of a context.
  *
  * @param[in] ctx Context being destroyed.

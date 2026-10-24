@@ -430,9 +430,10 @@ lyd_val_incr_collect(const struct lyd_node *tree, const struct lys_module *mod, 
             }
 
             /* remember what the edit touched, for every module: a constraint of the validated module may well
-             * read another module's data */
-            LY_CHECK_RET(lyd_val_incr_touch((op == LYD_DIFF_OP_CREATE) ? &incr->created : &incr->modified,
-                    diter->schema));
+             * read another module's data; a diff that does not describe defaults calls a node created even when
+             * it replaced an implicit one, so such a create may have removed or changed default data */
+            LY_CHECK_RET(lyd_val_incr_touch(((op == LYD_DIFF_OP_CREATE) && !lyd_val_deps_is_implicit(diter->schema)) ?
+                    &incr->created : &incr->modified, diter->schema));
 
             /* collected for every module as well: the same value may be held by data of another module */
             LY_CHECK_RET(lyd_val_incr_values(index, diter, incr));

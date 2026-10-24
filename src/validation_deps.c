@@ -788,11 +788,8 @@ lyd_val_dep_add_leafrefs(struct lyd_val_dep_index *index, const struct lysc_node
     }
 }
 
-/**
- * @brief Whether a node can appear in the data without anyone asking for it.
- */
-static ly_bool
-lyd_val_dep_is_implicit(const struct lysc_node *snode)
+ly_bool
+lyd_val_deps_is_implicit(const struct lysc_node *snode)
 {
     switch (snode->nodetype) {
     case LYS_LEAF:
@@ -819,7 +816,7 @@ lyd_val_dep_add_node(struct lyd_val_dep_index *index, const struct lysc_node *sn
     LY_ERR rc = LY_SUCCESS;
 
     whens = lysc_node_when(snode);
-    if (whens && lyd_val_dep_is_implicit(snode)) {
+    if (whens && lyd_val_deps_is_implicit(snode)) {
         LY_CHECK_RET(ly_set_add(&index->dflt_when, (void *)snode, 0, NULL));
     }
     LY_ARRAY_FOR(whens, u) {
@@ -838,7 +835,7 @@ lyd_val_dep_add_node(struct lyd_val_dep_index *index, const struct lysc_node *sn
 
         /* an implicit default appears without the edit describing it, so its value could not be recognised as
          * touched and the constraint has to keep being evaluated on every instance */
-        if (!rc && (cls == LYD_VAL_DEP_BOUNDED) && !lyd_val_dep_is_implicit(snode) &&
+        if (!rc && (cls == LYD_VAL_DEP_BOUNDED) && !lyd_val_deps_is_implicit(snode) &&
                 lyd_val_dep_value_keyed_shape(musts[u].cond, snode, atom_set)) {
             rc = lyd_val_dep_value_keyed_mark(index, musts[u].cond);
         }
