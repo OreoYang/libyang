@@ -574,6 +574,18 @@ LIBYANG_API_DECL LY_ERR lyd_validate_module_incr_final(struct lyd_node *tree, co
 LIBYANG_API_DECL void lyd_validate_incr_stats(const struct ly_ctx *ctx, uint64_t *calls, uint64_t *fallbacks);
 
 /**
+ * @brief Read how many incremental validation fallbacks came late.
+ *
+ * A late fallback happens after the incremental passes ran, because the validation deleted a node itself (a when
+ * turned false, a default or a case replaced). They are already counted in the fallbacks of
+ * ::lyd_validate_incr_stats(); a high number here means that a rule deletes data on most edits.
+ *
+ * @param[in] ctx Context to read, NULL for the totals of the process.
+ * @param[out] late_fallbacks Late fallbacks.
+ */
+LIBYANG_API_DECL void lyd_validate_incr_late_stats(const struct ly_ctx *ctx, uint64_t *late_fallbacks);
+
+/**
  * @brief Read the "must" counters of incremental validation.
  *
  * Only conditions seen by an incremental validation are counted, a full validation leaves both counters alone.

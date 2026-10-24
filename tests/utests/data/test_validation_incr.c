@@ -826,6 +826,10 @@ static const char *schema_b =
         "                when \"not(/a:ifs/a:if[a:name = current()/../ifname]/b:b-cfg/b:speed < 500)\";\n"
         "                type string;\n"
         "            }\n"
+        "            leaf hi2 {\n"
+        "                when \"not(/a:ifs/a:if[a:name = current()/../ifname]/b:b-cfg/b:m1-val)\";\n"
+        "                type string;\n"
+        "            }\n"
         "        }\n"
         "    }\n"
         "}";
@@ -859,6 +863,20 @@ static const char *schema_c =
         "            leaf m1need {\n"
         "                type string;\n"
         "                must \"/a:ifs/a:if[a:name = current()/../ifname]/b:b-cfg/b:m1-val = 1\";\n"
+        "            }\n"
+        "            leaf nom1 {\n"
+        "                type string;\n"
+        "                must \"not(/a:ifs/a:if[a:name = current()/../ifname]/b:b-cfg/b:m1-val)\";\n"
+        "            }\n"
+        /* the first ip of the interface: a node that appears in front of it changes the value, so creating data
+         * is not safe for this one, unlike the plain comparison */
+        "            leaf ipfirst {\n"
+        "                type string;\n"
+        "                must \"contains(/a:ifs/a:if[a:name = current()/../ifname]/b:b-addr/b:ip, '10.')\";\n"
+        "            }\n"
+        "            leaf ipany {\n"
+        "                type string;\n"
+        "                must \"/a:ifs/a:if[a:name = current()/../ifname]/b:b-addr/b:ip = '10.0.0.1'\";\n"
         "            }\n"
         /* a first-pass reader of data that module b autodeletes */
         "            leaf cs { type leafref { path \"/a:ifs/a:if/b:b-cfg/b:speed\"; } }\n"
@@ -1251,6 +1269,134 @@ test_aug_dflt_replace(void **state)
 }
 
 /**
+ * @brief A rule that reads the first node of a node-set is not safe to skip on creation, one that only asks
+ * whether some node matches is.
+ */
+static void
+test_aug_first_node_func(void **state)
+{
+    const struct lys_module *mod;
+    const struct lyd_val_dep_index *index;
+    const struct lyd_val_constraint *cons;
+    uint32_t i, seen = 0;
+
+    aug_setup(state);
+
+    mod = ly_ctx_get_module_implemented(UTEST_LYCTX, "c");
+    assert_int_equal(LY_SUCCESS, lyd_val_deps_get(mod, &index));
+    for (i = 0; i < index->constraint_count; ++i) {
+        cons = &index->constraints[i];
+        if (!strcmp(cons->snode->name, "ipfirst")) {
+            assert_false(cons->creation_safe);
+            ++seen;
+        } else if (!strcmp(cons->snode->name, "ipany")) {
+            assert_true(cons->creation_safe);
+            ++seen;
+        }
+    }
+    assert_int_equal(2, seen);
+
+    aug_done();
+}
+
+#define DEEP_LEVELS 70
+
+/**
+ * @brief A node deeper than the ancestor chain of the diff lookup used to be taken for a deleted top-level
+ * instance, so nothing above it was revalidated.
+ */
+static void
+test_aug_deep_delete(void **state)
+{
+    char schema[8192] = "module deep {\n    namespace urn:tests:deep;\n    prefix deep;\n    yang-version 1.1;\n";
+    char path[4096] = "", xml[4096] = "", del[4096] = "-", tmp[64];
+    struct lyd_node *before, *after;
+    const char *edit[] = {del, NULL, NULL, NULL};
+    uint64_t fb_before = 0, fb_after = 0;
+    LY_ERR rc;
+    int i;
+
+    /* only list instances can be left out of a scoped pass, so the deep node sits below one */
+    strcat(schema, "list l {\nkey k;\nleaf k { type string; }\n");
+    for (i = 1; i < DEEP_LEVELS; ++i) {
+        snprintf(tmp, sizeof tmp, "container c%d {\n", i);
+        strcat(schema, tmp);
+    }
+    strcat(schema, "leaf x { type string; }\nleaf m { type string; mandatory true; }\n");
+    for (i = 1; i < DEEP_LEVELS; ++i) {
+        strcat(schema, "}\n");
+    }
+    strcat(schema, "}\n}\n");
+
+    UTEST_ADD_MODULE(schema, LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "deep";
+    check_mods[1] = NULL;
+
+    strcpy(path, "/deep:l[k='1']");
+    for (i = 1; i < DEEP_LEVELS; ++i) {
+        snprintf(tmp, sizeof tmp, "/c%d", i);
+        strcat(path, tmp);
+    }
+    for (rc = 0; rc < 2; ++rc) {
+        strcat(xml, rc ? "<l xmlns=\"urn:tests:deep\"><k>2</k>" : "<l xmlns=\"urn:tests:deep\"><k>1</k>");
+        for (i = 1; i < DEEP_LEVELS; ++i) {
+            snprintf(tmp, sizeof tmp, "<c%d>", i);
+            strcat(xml, tmp);
+        }
+        strcat(xml, "<x>1</x><m>2</m>");
+        for (i = DEEP_LEVELS - 1; i >= 1; --i) {
+            snprintf(tmp, sizeof tmp, "</c%d>", i);
+            strcat(xml, tmp);
+        }
+        strcat(xml, "</l>");
+    }
+    strcat(del, path);
+    strcat(del, "/m");
+
+    before = parse_valid(state, xml);
+    after = aug_apply(state, before, edit);
+    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fb_before);
+    check_same(state, before, after, 1, &rc);
+    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fb_after);
+    /* the mandatory leaf is gone, full validation says so and the incremental one has to as well, without
+     * giving up: the lookup has to find the deleted node's parent */
+    assert_int_equal(LY_EVALID, rc);
+    assert_int_equal(fb_before, fb_after);
+
+    lyd_free_siblings(after);
+    lyd_free_siblings(before);
+    check_mods[0] = "a";
+}
+
+/**
+ * @brief Probe: the edit deletes the explicit case, so the validation brings the default case back.
+ */
+static void
+test_aug_dflt_case_back(void **state)
+{
+    struct lyd_node *before, *start;
+    const char *setup_must[] = {"/a:ifs/if[name='e1']/b:b-cfg/m2-val", "5",
+        "/c:c-refs/c-ref[name='r7']/ifname", "e1", "/c:c-refs/c-ref[name='r7']/nom1", "y", NULL, NULL};
+    const char *setup_when[] = {"/a:ifs/if[name='e1']/b:b-cfg/m2-val", "5",
+        "/b:b-top/b-chk[name='k5']/ifname", "e1", "/b:b-top/b-chk[name='k5']/hi2", "y", NULL, NULL};
+    const char *del_m2[] = {"-/a:ifs/a:if[a:name='e1']/b:b-cfg/b:m2-val", NULL, NULL, NULL};
+
+    aug_setup(state);
+    before = parse_valid(state, aug_xml);
+
+    start = aug_start(state, before, setup_must);
+    aug_check_multi(state, start, del_m2, LY_EVALID);
+    lyd_free_siblings(start);
+
+    start = aug_start(state, before, setup_when);
+    aug_check_multi(state, start, del_m2, LY_SUCCESS);
+    lyd_free_siblings(start);
+
+    lyd_free_siblings(before);
+    aug_done();
+}
+
+/**
  * @brief The default case is replaced inside a container that only existed as a default.
  *
  * The edit diff does not see default nodes, so it calls the whole b-cfg of x1 created, and the m1-val default that
@@ -1601,6 +1747,9 @@ main(void)
         UTEST(test_aug_when_create),
         UTEST(test_aug_dflt_replace),
         UTEST(test_aug_dflt_case_in_dflt),
+        UTEST(test_aug_dflt_case_back),
+        UTEST(test_aug_first_node_func),
+        UTEST(test_aug_deep_delete),
         UTEST(test_aug_module_order),
         UTEST(test_aug_instance_identifier),
         UTEST(test_aug_random_edits),

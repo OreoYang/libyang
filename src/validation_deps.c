@@ -51,7 +51,11 @@ static const char *const lyd_val_dep_simple_axes[] = {
  * cannot be assumed unaffected by creations.
  */
 static const char *const lyd_val_dep_antitone_funcs[] = {
-    "count", "last", "not", "position", "string-length", "sum", NULL
+    "count", "last", "not", "position", "string-length", "sum",
+    /* these turn a node-set into the value of its first node, so a node that appears in front changes the result */
+    "bit-is-set", "ceiling", "concat", "contains", "enum-value", "floor", "lang", "local-name", "name",
+    "namespace-uri", "normalize-space", "number", "re-match", "round", "starts-with", "string", "substring",
+    "substring-after", "substring-before", "translate", NULL
 };
 
 const char *

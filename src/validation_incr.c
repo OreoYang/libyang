@@ -243,6 +243,7 @@ lyd_val_incr_values(const struct lyd_val_dep_index *index, const struct lyd_node
     struct lyd_val_incr_valset *vs;
     const struct lyd_node *elem;
     const char *orig;
+    enum lyd_diff_op op;
     ly_bool found;
     uint32_t i;
 
@@ -268,6 +269,9 @@ lyd_val_incr_values(const struct lyd_val_dep_index *index, const struct lyd_node
                 orig = lyd_val_incr_orig_value(elem);
                 if (orig) {
                     LY_CHECK_RET(lyd_val_incr_valset_add(vs, orig));
+                } else if (lyd_val_incr_diff_op(elem, &op) && (op == LYD_DIFF_OP_REPLACE)) {
+                    /* the old value is not spelled out, so which value was freed is unknown */
+                    vs->unknown = 1;
                 }
             }
             LYD_TREE_DFS_END(diff_node, elem);
@@ -331,27 +335,29 @@ lyd_val_incr_must_skip(const struct lyd_val_incr *incr, const struct lyd_node *n
 static ly_bool
 lyd_val_incr_find(const struct lyd_node *tree, const struct lyd_node *diff_node, struct lyd_node **match)
 {
-    const struct lyd_node *chain[64], *dnode;
+    const struct lyd_node *dnode, *level;
     struct lyd_node *cur = NULL, *found;
     const struct lyd_node *siblings;
-    uint32_t depth = 0, i;
+    uint32_t depth = 0, i, j;
 
     *match = NULL;
 
     for (dnode = diff_node; dnode; dnode = lyd_parent(dnode)) {
-        if (depth == (sizeof chain / sizeof *chain)) {
-            return 0;
-        }
-        chain[depth++] = dnode;
+        ++depth;
     }
-
+    /* no depth limit: a node that is too deep to match would be taken for a deleted top-level instance */
     siblings = tree;
     for (i = depth; i > 0; --i) {
-        if (!chain[i - 1]->schema) {
+        level = diff_node;
+        for (j = 1; j < i; ++j) {
+            level = lyd_parent(level);
+        }
+
+        if (!level->schema) {
             /* opaque diff node, cannot be matched reliably */
             return 0;
         }
-        if (lyd_find_sibling_first(siblings, chain[i - 1], &found) || !found) {
+        if (lyd_find_sibling_first(siblings, level, &found) || !found) {
             *match = cur;
             return 0;
         }
@@ -719,11 +725,27 @@ lyd_val_incr_count_late_fallback(const struct ly_ctx *ctx)
 
     pthread_mutex_lock(&c->val_deps_lock);
     ++c->val_incr_stats.fallbacks;
+    ++c->val_incr_stats.late_fallbacks;
     pthread_mutex_unlock(&c->val_deps_lock);
 
     pthread_mutex_lock(&lyd_val_incr_glob_lock);
     ++lyd_val_incr_glob.fallbacks;
+    ++lyd_val_incr_glob.late_fallbacks;
     pthread_mutex_unlock(&lyd_val_incr_glob_lock);
+}
+
+LIBYANG_API_DEF void
+lyd_validate_incr_late_stats(const struct ly_ctx *ctx, uint64_t *late_fallbacks)
+{
+    struct ly_ctx *c = (struct ly_ctx *)ctx;
+    pthread_mutex_t *lock = ctx ? &c->val_deps_lock : &lyd_val_incr_glob_lock;
+    const struct lyd_validate_incr_stats *stats = ctx ? &c->val_incr_stats : &lyd_val_incr_glob;
+
+    pthread_mutex_lock(lock);
+    if (late_fallbacks) {
+        *late_fallbacks = stats->late_fallbacks;
+    }
+    pthread_mutex_unlock(lock);
 }
 
 void
