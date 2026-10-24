@@ -874,6 +874,10 @@ static const char *schema_c =
         "                type string;\n"
         "                must \"contains(/a:ifs/a:if[a:name = current()/../ifname]/b:b-addr/b:ip, '10.')\";\n"
         "            }\n"
+        "            leaf idmath {\n"
+        "                type string;\n"
+        "                must \"/a:ifs/a:if[a:name = current()/../ifname]/b:b-addr/b:id + 0 > 1\";\n"
+        "            }\n"
         "            leaf ipany {\n"
         "                type string;\n"
         "                must \"/a:ifs/a:if[a:name = current()/../ifname]/b:b-addr/b:ip = '10.0.0.1'\";\n"
@@ -1286,7 +1290,7 @@ test_aug_first_node_func(void **state)
     assert_int_equal(LY_SUCCESS, lyd_val_deps_get(mod, &index));
     for (i = 0; i < index->constraint_count; ++i) {
         cons = &index->constraints[i];
-        if (!strcmp(cons->snode->name, "ipfirst")) {
+        if (!strcmp(cons->snode->name, "ipfirst") || !strcmp(cons->snode->name, "idmath")) {
             assert_false(cons->creation_safe);
             ++seen;
         } else if (!strcmp(cons->snode->name, "ipany")) {
@@ -1294,7 +1298,7 @@ test_aug_first_node_func(void **state)
             ++seen;
         }
     }
-    assert_int_equal(2, seen);
+    assert_int_equal(3, seen);
 
     aug_done();
 }
@@ -1314,7 +1318,7 @@ test_aug_deep_delete(void **state)
     const char *edit[] = {del, NULL, NULL, NULL};
     uint64_t fb_before = 0, fb_after = 0;
     LY_ERR rc;
-    int i;
+    int i, entry;
 
     /* only list instances can be left out of a scoped pass, so the deep node sits below one */
     strcat(schema, "list l {\nkey k;\nleaf k { type string; }\n");
@@ -1337,8 +1341,8 @@ test_aug_deep_delete(void **state)
         snprintf(tmp, sizeof tmp, "/c%d", i);
         strcat(path, tmp);
     }
-    for (rc = 0; rc < 2; ++rc) {
-        strcat(xml, rc ? "<l xmlns=\"urn:tests:deep\"><k>2</k>" : "<l xmlns=\"urn:tests:deep\"><k>1</k>");
+    for (entry = 0; entry < 2; ++entry) {
+        strcat(xml, entry ? "<l xmlns=\"urn:tests:deep\"><k>2</k>" : "<l xmlns=\"urn:tests:deep\"><k>1</k>");
         for (i = 1; i < DEEP_LEVELS; ++i) {
             snprintf(tmp, sizeof tmp, "<c%d>", i);
             strcat(xml, tmp);

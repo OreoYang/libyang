@@ -306,6 +306,16 @@ lyd_val_dep_shape_scan(const struct lyxp_expr *expr, struct lyd_val_dep_shape *s
                 shape->antitone = 1;
             }
             break;
+        case LYXP_TOKEN_OPER_MATH: {
+            uint32_t from, to;
+
+            /* arithmetic turns a node-set into the number of its first node, like number() */
+            lyd_val_dep_operand_span(expr, i, &from, &to);
+            if (lyd_val_dep_span_has_abs(expr, from, to)) {
+                shape->antitone = 1;
+            }
+            break;
+        }
         case LYXP_TOKEN_OPER_NEQUAL: {
             uint32_t from, to;
 

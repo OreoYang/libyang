@@ -689,30 +689,43 @@ cleanup:
 static pthread_mutex_t lyd_val_incr_glob_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct lyd_validate_incr_stats lyd_val_incr_glob;
 
+/**
+ * @brief Add counters to the totals of the context and of the process.
+ */
+static void
+lyd_val_incr_stats_add(const struct ly_ctx *ctx, const struct lyd_validate_incr_stats *delta)
+{
+    struct ly_ctx *c = (struct ly_ctx *)ctx;
+    struct lyd_validate_incr_stats *dst[2] = {&c->val_incr_stats, &lyd_val_incr_glob};
+    pthread_mutex_t *lock[2] = {&c->val_deps_lock, &lyd_val_incr_glob_lock};
+    uint32_t i;
+
+    for (i = 0; i < 2; ++i) {
+        pthread_mutex_lock(lock[i]);
+        dst[i]->calls += delta->calls;
+        dst[i]->fallbacks += delta->fallbacks;
+        dst[i]->scope_roots += delta->scope_roots;
+        dst[i]->extra_nodes += delta->extra_nodes;
+        dst[i]->must_evals += delta->must_evals;
+        dst[i]->must_skips += delta->must_skips;
+        dst[i]->late_fallbacks += delta->late_fallbacks;
+        pthread_mutex_unlock(lock[i]);
+    }
+}
+
 static void
 lyd_val_incr_count(const struct ly_ctx *ctx, const struct lyd_val_incr *incr, ly_bool fallback)
 {
-    struct ly_ctx *c = (struct ly_ctx *)ctx;
+    struct lyd_validate_incr_stats delta = {0};
 
-    pthread_mutex_lock(&c->val_deps_lock);
-    ++c->val_incr_stats.calls;
+    delta.calls = 1;
     if (fallback) {
-        ++c->val_incr_stats.fallbacks;
+        delta.fallbacks = 1;
     } else {
-        c->val_incr_stats.scope_roots += incr->roots.count;
-        c->val_incr_stats.extra_nodes += incr->extra.count;
+        delta.scope_roots = incr->roots.count;
+        delta.extra_nodes = incr->extra.count;
     }
-    pthread_mutex_unlock(&c->val_deps_lock);
-
-    pthread_mutex_lock(&lyd_val_incr_glob_lock);
-    ++lyd_val_incr_glob.calls;
-    if (fallback) {
-        ++lyd_val_incr_glob.fallbacks;
-    } else {
-        lyd_val_incr_glob.scope_roots += incr->roots.count;
-        lyd_val_incr_glob.extra_nodes += incr->extra.count;
-    }
-    pthread_mutex_unlock(&lyd_val_incr_glob_lock);
+    lyd_val_incr_stats_add(ctx, &delta);
 }
 
 /**
@@ -721,17 +734,11 @@ lyd_val_incr_count(const struct ly_ctx *ctx, const struct lyd_val_incr *incr, ly
 static void
 lyd_val_incr_count_late_fallback(const struct ly_ctx *ctx)
 {
-    struct ly_ctx *c = (struct ly_ctx *)ctx;
+    struct lyd_validate_incr_stats delta = {0};
 
-    pthread_mutex_lock(&c->val_deps_lock);
-    ++c->val_incr_stats.fallbacks;
-    ++c->val_incr_stats.late_fallbacks;
-    pthread_mutex_unlock(&c->val_deps_lock);
-
-    pthread_mutex_lock(&lyd_val_incr_glob_lock);
-    ++lyd_val_incr_glob.fallbacks;
-    ++lyd_val_incr_glob.late_fallbacks;
-    pthread_mutex_unlock(&lyd_val_incr_glob_lock);
+    delta.fallbacks = 1;
+    delta.late_fallbacks = 1;
+    lyd_val_incr_stats_add(ctx, &delta);
 }
 
 LIBYANG_API_DEF void
@@ -751,21 +758,15 @@ lyd_validate_incr_late_stats(const struct ly_ctx *ctx, uint64_t *late_fallbacks)
 void
 lyd_val_incr_must_count(const struct ly_ctx *ctx, uint64_t evals, uint64_t skips)
 {
-    struct ly_ctx *c = (struct ly_ctx *)ctx;
+    struct lyd_validate_incr_stats delta = {0};
 
     if (!evals && !skips) {
         return;
     }
 
-    pthread_mutex_lock(&c->val_deps_lock);
-    c->val_incr_stats.must_evals += evals;
-    c->val_incr_stats.must_skips += skips;
-    pthread_mutex_unlock(&c->val_deps_lock);
-
-    pthread_mutex_lock(&lyd_val_incr_glob_lock);
-    lyd_val_incr_glob.must_evals += evals;
-    lyd_val_incr_glob.must_skips += skips;
-    pthread_mutex_unlock(&lyd_val_incr_glob_lock);
+    delta.must_evals = evals;
+    delta.must_skips = skips;
+    lyd_val_incr_stats_add(ctx, &delta);
 }
 
 LIBYANG_API_DEF void
