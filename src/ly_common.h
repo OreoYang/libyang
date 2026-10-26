@@ -35,6 +35,20 @@
 struct ly_ctx;
 struct ly_in;
 struct lysc_node;
+struct lyd_val_dep_index;
+
+/**
+ * @brief Incremental validation counters, see ::lyd_validate_incr_stats().
+ */
+struct lyd_validate_incr_stats {
+    uint64_t calls;             /**< incremental validation entry points called */
+    uint64_t fallbacks;         /**< of those, the ones that validated the whole module instead */
+    uint64_t scope_roots;       /**< subtrees selected for revalidation across all calls */
+    uint64_t extra_nodes;       /**< nodes revalidated because a cross-instance constraint could have changed */
+    uint64_t must_evals;        /**< "must" conditions evaluated by incremental validation */
+    uint64_t must_skips;        /**< "must" conditions skipped because the edit could not have violated them */
+    uint64_t late_fallbacks;    /**< fallbacks decided after the incremental passes ran */
+};
 
 #if __STDC_VERSION__ >= 201112 && !defined __STDC_NO_THREADS__
 # define THREAD_LOCAL _Thread_local
@@ -367,6 +381,11 @@ struct ly_ctx_shared_data {
     pthread_mutex_t leafref_links_lock; /**< lock for accessing the leafref links hash table */
     struct ly_ht *leafref_links_ht;     /**< hash table of leafref links between term data nodes */
     void *semver_pattern;               /**< compiled pattern for semver matching */
+
+    struct lyd_val_dep_index **val_deps; /**< incremental validation dependency indexes, guarded by a static lock in
+                                           validation_deps.c so that printed contexts need no initialization */
+    uint32_t val_deps_count;             /**< number of dependency indexes */
+    struct lyd_validate_incr_stats val_incr_stats;  /**< counters, guarded by a static lock in validation_incr.c */
 };
 
 #define LY_CTX_INT_IMMUTABLE 0x80000000 /**< marks a context that was printed into a fixed-size memory block and

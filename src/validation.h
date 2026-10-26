@@ -24,8 +24,55 @@
 struct ly_ctx;
 struct ly_set;
 struct lyd_node;
+struct lyd_val_incr;
 struct lys_module;
+struct lysc_must;
 struct lysc_node;
+
+/**
+ * @brief Check validation error taking into account multi-error validation.
+ *
+ * @param[in] r Local return value.
+ * @param[in] err_cmd Command to perform on any error.
+ * @param[in] val_opts Validation options.
+ * @param[in] label Label to go to on fatal error.
+ */
+#define LY_VAL_ERR_GOTO(r, err_cmd, val_opts, label) \
+        if (r) { \
+            err_cmd; \
+            if ((r != LY_EVALID) || !(val_opts & LYD_VALIDATE_MULTI_ERROR)) { \
+                goto label; \
+            } \
+        }
+
+/**
+ * @brief Part of the data tree that the final validation of an incremental validation has to look at.
+ */
+struct lyd_val_scope {
+    const struct ly_set *roots;         /**< data subtrees to validate in full */
+    const struct ly_set *path;          /**< ::lyd_val_scope.roots and all their data ancestors */
+    const struct lyd_val_incr *incr;    /**< incremental validation state, for the "must" counters and filtering */
+};
+
+/**
+ * @brief Check whether the edit could not have violated a "must" condition, so it need not be evaluated.
+ *
+ * @param[in] incr Incremental validation state, NULL when validating in full.
+ * @param[in] node Data node the condition belongs to.
+ * @param[in] must Condition to check.
+ * @return Whether the evaluation can be skipped.
+ */
+ly_bool lyd_val_incr_must_skip(const struct lyd_val_incr *incr, const struct lyd_node *node,
+        const struct lysc_must *must);
+
+/**
+ * @brief Count the "must" conditions evaluated and skipped for a node.
+ *
+ * @param[in] incr Incremental validation state.
+ * @param[in] evals Conditions evaluated.
+ * @param[in] skips Conditions skipped.
+ */
+void lyd_val_incr_must_count(const struct lyd_val_incr *incr, uint64_t evals, uint64_t skips);
 
 /**
  * @brief Cached getnext schema nodes stored in a validation HT.
@@ -119,6 +166,25 @@ LY_ERR lyd_validate_new(struct lyd_node **first, const struct lysc_node *sparent
         uint32_t val_opts, uint32_t int_opts, struct ly_ht *getnext_ht, struct lyd_node **diff);
 
 /**
+ * @brief Validate the whole data subtree.
+ *
+ * @param[in] root Subtree root.
+ * @param[in] ext Extension instance whose data to validate.
+ * @param[in,out] node_when Set for nodes with when conditions.
+ * @param[in,out] node_types Set for unres node types.
+ * @param[in,out] meta_types Set for unres metadata types.
+ * @param[in,out] ext_val Set for parsed extension data to validate.
+ * @param[in] val_opts Validation options.
+ * @param[in] int_opts Internal parser options.
+ * @param[in,out] getnext_ht Getnext HT to use.
+ * @param[in,out] diff Validation diff.
+ * @return LY_ERR value.
+ */
+LY_ERR lyd_validate_tree(struct lyd_node *root, const struct lysc_ext_instance *ext, struct ly_set *node_when,
+        struct ly_set *node_types, struct ly_set *meta_types, struct ly_set *ext_val, uint32_t val_opts,
+        uint32_t int_opts, struct ly_ht *getnext_ht, struct lyd_node **diff);
+
+/**
  * @brief Validate data tree created by an extension instance by storing it in unres.
  *
  * @param[in] node Node with ::LYD_EXT flag whose subtree needs to be validated by an ext instance callback.
@@ -136,6 +202,38 @@ LY_ERR lyd_validate_tree_ext(struct lyd_node *node, const struct lysc_ext_instan
  * @return LY_ERR value.
  */
 LY_ERR lyd_validate_node_ext(struct lyd_node *node, struct ly_set *ext_val);
+
+/**
+ * @brief Validate must conditions of a data node.
+ *
+ * @param[in] node Node to validate.
+ * @param[in] val_opts Validation options.
+ * @param[in] int_opts Internal parser options.
+ * @param[in] xpath_opts Additional XPath options to use.
+ * @param[in] incr Incremental validation state, NULL to evaluate every condition.
+ * @return LY_ERR value.
+ */
+LY_ERR lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_opts, uint32_t xpath_opts,
+        const struct lyd_val_incr *incr);
+
+/**
+ * @brief Perform all remaining validation tasks, the data tree must be final when calling this function.
+ *
+ * @param[in] first First sibling.
+ * @param[in] parent Data parent.
+ * @param[in] sparent Schema parent of the siblings, NULL for top-level siblings.
+ * @param[in] mod Module of the siblings, NULL for nested siblings.
+ * @param[in] ext Extension instance to use, if relevant.
+ * @param[in] val_opts Validation options (@ref datavalidationoptions).
+ * @param[in] int_opts Internal parser options.
+ * @param[in] must_xp_opts Additional XPath options to use for evaluating "must".
+ * @param[in,out] getnext_ht Getnext HT to use.
+ * @param[in] scope Scope of the incremental validation, NULL to validate everything.
+ * @return LY_ERR value.
+ */
+LY_ERR lyd_validate_final_r(struct lyd_node *first, const struct lyd_node *parent, const struct lysc_node *sparent,
+        const struct lys_module *mod, const struct lysc_ext_instance *ext, uint32_t val_opts, uint32_t int_opts,
+        uint32_t must_xp_opts, struct ly_ht *getnext_ht, const struct lyd_val_scope *scope);
 
 /**
  * @brief Validate a data tree.

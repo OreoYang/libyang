@@ -43,22 +43,6 @@
 #include "xpath.h"
 
 /**
- * @brief Check validation error taking into account multi-error validation.
- *
- * @param[in] r Local return value.
- * @param[in] err_cmd Command to perform on any error.
- * @param[in] val_opts Validation options.
- * @param[in] label Label to go to on fatal error.
- */
-#define LY_VAL_ERR_GOTO(r, err_cmd, val_opts, label) \
-        if (r) { \
-            err_cmd; \
-            if ((r != LY_EVALID) || !(val_opts & LYD_VALIDATE_MULTI_ERROR)) { \
-                goto label; \
-            } \
-        }
-
-/**
  * @brief Callback for freeing getnext HT values.
  */
 static void
@@ -1718,10 +1702,12 @@ lyd_validate_obsolete(const struct lyd_node *node)
  * @param[in] val_opts Validation options.
  * @param[in] int_opts Internal parser options.
  * @param[in] xpath_opts Additional XPath options to use.
+ * @param[in] incr Incremental validation state, NULL to evaluate every condition.
  * @return LY_ERR value.
  */
-static LY_ERR
-lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_opts, uint32_t xpath_opts)
+LY_ERR
+lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_opts, uint32_t xpath_opts,
+        const struct lyd_val_incr *incr)
 {
     LY_ERR r, rc = LY_SUCCESS;
     struct lyxp_set xp_set;
@@ -1729,6 +1715,7 @@ lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_o
     const struct lyd_node *tree;
     const struct lysc_node *schema;
     const char *emsg, *eapptag;
+    uint64_t evals = 0, skips = 0;
     LYA_COUNT_T u;
 
     assert((int_opts & (LYD_INTOPT_RPC | LYD_INTOPT_REPLY)) != (LYD_INTOPT_RPC | LYD_INTOPT_REPLY));
@@ -1756,6 +1743,11 @@ lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_o
     tree = lyd_first_sibling(tree);
 
     LYA_FOR(musts, u) {
+        if (lyd_val_incr_must_skip(incr, node, &musts[u])) {
+            ++skips;
+            continue;
+        }
+        ++evals;
         memset(&xp_set, 0, sizeof xp_set);
 
         /* evaluate must */
@@ -1794,7 +1786,27 @@ lyd_validate_must(const struct lyd_node *node, uint32_t val_opts, uint32_t int_o
     }
 
 cleanup:
+    if (incr) {
+        lyd_val_incr_must_count(incr, evals, skips);
+    }
     return rc;
+}
+
+/**
+ * @brief Check whether the scoped final validation can skip a list or leaf-list instance.
+ *
+ * @param[in] scope Scope of the incremental validation, NULL for a full validation.
+ * @param[in] node Data node to check.
+ * @return Whether the instance is outside the scope and so cannot have been changed by the edit.
+ */
+static ly_bool
+lyd_val_scope_skip(const struct lyd_val_scope *scope, const struct lyd_node *node)
+{
+    if (!scope || !scope->path || !node->schema ||
+            !(node->schema->nodetype & (LYS_LIST | LYS_LEAFLIST))) {
+        return 0;
+    }
+    return !ly_set_contains(scope->path, node, NULL);
 }
 
 /**
@@ -1809,16 +1821,18 @@ cleanup:
  * @param[in] int_opts Internal parser options.
  * @param[in] must_xp_opts Additional XPath options to use for evaluating "must".
  * @param[in,out] getnext_ht Getnext HT to use.
+ * @param[in] scope Scope of the incremental validation, NULL to validate everything.
  * @return LY_ERR value.
  */
-static LY_ERR
+LY_ERR
 lyd_validate_final_r(struct lyd_node *first, const struct lyd_node *parent, const struct lysc_node *sparent,
         const struct lys_module *mod, const struct lysc_ext_instance *ext, uint32_t val_opts, uint32_t int_opts,
-        uint32_t must_xp_opts, struct ly_ht *getnext_ht)
+        uint32_t must_xp_opts, struct ly_ht *getnext_ht, const struct lyd_val_scope *scope)
 {
     LY_ERR r, rc = LY_SUCCESS;
     const char *innode;
     struct lyd_node *node;
+    const struct lyd_val_scope inner = {.roots = NULL, .path = NULL, .incr = scope ? scope->incr : NULL};
 
     /* validate all restrictions of nodes themselves */
     LY_LIST_FOR(first, node) {
@@ -1836,6 +1850,10 @@ lyd_validate_final_r(struct lyd_node *first, const struct lyd_node *parent, cons
         if (!node->parent && mod && (lyd_owner_module(node) != mod)) {
             /* all top-level data from this module checked */
             break;
+        }
+
+        if (lyd_val_scope_skip(scope, node)) {
+            continue;
         }
 
         /* no state/input/output/op data */
@@ -1870,7 +1888,8 @@ lyd_validate_final_r(struct lyd_node *first, const struct lyd_node *parent, cons
         lyd_validate_obsolete(node);
 
         /* node's musts */
-        if ((r = lyd_validate_must(node, val_opts, int_opts & ~LYD_INTOPT_SKIP_SIBLINGS, must_xp_opts))) {
+        if ((r = lyd_validate_must(node, val_opts, int_opts & ~LYD_INTOPT_SKIP_SIBLINGS, must_xp_opts,
+                scope ? scope->incr : NULL))) {
             goto next_iter;
         }
 
@@ -1898,9 +1917,13 @@ next_iter:
         /* skip when-false nodes: they are logically non-existent, so neither their children
          * nor their container-default handling must run */
         if (!(node->flags & LYD_WHEN_FALSE)) {
+            if (lyd_val_scope_skip(scope, node)) {
+                continue;
+            }
             /* validate all children recursively */
             r = lyd_validate_final_r(lyd_child(node), node, node->schema, NULL, ext, val_opts,
-                    int_opts & ~LYD_INTOPT_SKIP_SIBLINGS, must_xp_opts, getnext_ht);
+                    int_opts & ~LYD_INTOPT_SKIP_SIBLINGS, must_xp_opts, getnext_ht,
+                    (scope && scope->path && ly_set_contains(scope->roots, node, NULL)) ? &inner : scope);
             LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
 
             /* set default for containers */
@@ -2033,7 +2056,7 @@ lyd_validate_node_ext(struct lyd_node *node, struct ly_set *ext_val)
  * @param[in,out] diff Validation diff.
  * @return LY_ERR value.
  */
-static LY_ERR
+LY_ERR
 lyd_validate_tree(struct lyd_node *root, const struct lysc_ext_instance *ext, struct ly_set *node_when,
         struct ly_set *node_types, struct ly_set *meta_types, struct ly_set *ext_val, uint32_t val_opts,
         uint32_t int_opts, struct ly_ht *getnext_ht, struct lyd_node **diff)
@@ -2231,7 +2254,7 @@ lyd_validate(struct lyd_node **tree, const struct lys_module *module, const stru
             first = *tree;
             lyd_first_module_sibling(&first, mod);
 
-            r = lyd_validate_final_r(first, NULL, NULL, mod, NULL, val_opts, 0, 0, getnext_ht);
+            r = lyd_validate_final_r(first, NULL, NULL, mod, NULL, val_opts, 0, 0, getnext_ht, NULL);
             LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
         }
     }
@@ -2285,7 +2308,8 @@ lyd_validate_ext(struct lyd_node **subtree, const struct lysc_ext_instance *ext,
                 continue;
             }
 
-            r = lyd_validate_final_r(iter, NULL, NULL, NULL, ext, val_opts, LYD_INTOPT_SKIP_SIBLINGS, 0, getnext_ht);
+            r = lyd_validate_final_r(iter, NULL, NULL, NULL, ext, val_opts, LYD_INTOPT_SKIP_SIBLINGS, 0, getnext_ht,
+                    NULL);
             LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
         }
     }
@@ -2348,7 +2372,7 @@ lyd_validate_module_final(struct lyd_node *tree, const struct lys_module *module
     LY_CHECK_ERR_GOTO(r, rc = r, cleanup);
 
     /* perform final validation that assumes the data tree is final */
-    r = lyd_validate_final_r(first, NULL, NULL, mod, NULL, val_opts, 0, 0, getnext_ht);
+    r = lyd_validate_final_r(first, NULL, NULL, mod, NULL, val_opts, 0, 0, getnext_ht, NULL);
     LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
 
 cleanup:
@@ -2509,11 +2533,11 @@ _lyd_validate_op(struct lyd_node *op_tree, struct lyd_node *op_node, const struc
 
     /* perform final validation of the operation/notification */
     lyd_validate_obsolete(op_node);
-    LY_CHECK_GOTO(rc = lyd_validate_must(op_node, val_opts, int_opts, LYXP_IGNORE_WHEN), cleanup);
+    LY_CHECK_GOTO(rc = lyd_validate_must(op_node, val_opts, int_opts, LYXP_IGNORE_WHEN, NULL), cleanup);
 
     /* final validation of all the descendants */
     rc = lyd_validate_final_r(lyd_child(op_node), op_node, op_node->schema, NULL, NULL, val_opts, int_opts,
-            LYXP_IGNORE_WHEN, getnext_ht);
+            LYXP_IGNORE_WHEN, getnext_ht, NULL);
     LY_CHECK_GOTO(rc, cleanup);
 
 cleanup:

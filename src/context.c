@@ -49,6 +49,7 @@
 #include "tree_schema.h"
 #include "tree_schema_free.h"
 #include "tree_schema_internal.h"
+#include "validation_deps.h"
 
 #define IETF_YANG_LIB_REV "2019-01-04"
 
@@ -1601,11 +1602,19 @@ ly_ctx_destroy(struct ly_ctx *ctx)
 
     if (ctx->opts & LY_CTX_INT_IMMUTABLE) {
         if (!ctx->parent_ctx) {
+            /* incremental validation dependency indexes, kept while another printed context shares them */
+            lyd_val_deps_ctx_release(ctx);
+
             /* remove ctx data */
             ly_ctx_data_del(ctx);
         }
         lyplg_clean();
         return;
+    }
+
+    if (!ctx->parent_ctx) {
+        /* dependency indexes refer to compiled schema nodes */
+        lyd_val_deps_ctx_release(ctx);
     }
 
     /* free the parsed and compiled modules (both can reference ext instances, which need to be freed, so their
