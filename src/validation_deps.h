@@ -100,6 +100,9 @@ struct lyd_val_constraint {
  */
 struct lyd_val_dep_index {
     const struct lys_module *mod;
+    uint16_t change_count;              /**< change count of the context the index was built for, a later schema
+                                             change (an augment or a deviation of another module, a feature)
+                                             makes the index stale */
     struct lyd_val_constraint *constraints;
     uint32_t constraint_count;
 

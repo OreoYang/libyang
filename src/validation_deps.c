@@ -910,6 +910,7 @@ lyd_val_dep_index_build(const struct lys_module *mod, struct lyd_val_dep_index *
     index = calloc(1, sizeof *index);
     LY_CHECK_ERR_RET(!index, LOGMEM(mod->ctx), LY_EMEM);
     index->mod = mod;
+    index->change_count = ly_ctx_get_change_count(mod->ctx);
 
     if (!mod->compiled) {
         goto cleanup;
@@ -955,10 +956,24 @@ lyd_val_deps_get(const struct lys_module *mod, const struct lyd_val_dep_index **
     pthread_mutex_lock(&ctx->val_deps_lock);
 
     for (i = 0; i < ctx->val_deps_count; ++i) {
-        if (ctx->val_deps[i]->mod == mod) {
+        if (ctx->val_deps[i]->mod != mod) {
+            continue;
+        }
+
+        if (ctx->val_deps[i]->change_count == ly_ctx_get_change_count(ctx)) {
             *index = ctx->val_deps[i];
             goto cleanup;
         }
+
+        /* the schema changed after the index was built, it may miss constraints added to this module or constraints
+         * reading nodes that changed; the index is only used during one validation call and the schema must not
+         * change while data are being validated, so no one can still hold the old one */
+        rc = lyd_val_dep_index_build(mod, &built);
+        LY_CHECK_GOTO(rc, cleanup);
+        lyd_val_dep_index_free(ctx->val_deps[i]);
+        ctx->val_deps[i] = built;
+        *index = built;
+        goto cleanup;
     }
 
     rc = lyd_val_dep_index_build(mod, &built);

@@ -1724,6 +1724,43 @@ test_aug_random_edits(void **state)
     aug_done();
 }
 
+/**
+ * @brief The dependency index of a module is built on first use. A module loaded afterwards can augment it with
+ * constraints the index has never seen, so the index has to follow the schema, otherwise the incremental validation
+ * accepts an edit that the full one rejects.
+ */
+static void
+test_schema_change(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(schema_a, LYS_IN_YANG, NULL, NULL);
+
+    /* the first incremental validation builds the dependency index of module a */
+    before = parse_valid(state, "<ifs xmlns=\"urn:tests:a\"><if><name>e1</name><alias>a1</alias><type>eth</type>"
+            "</if></ifs>");
+    check_edit(state, before, "/a:ifs/if[name='e1']/alias", "a9", LY_SUCCESS);
+    lyd_free_siblings(before);
+
+    /* module b adds a leafref into the list of module a that reads the speed of the other instances, so an edit of
+     * one interface can break another one */
+    UTEST_ADD_MODULE(schema_b, LYS_IN_YANG, NULL, NULL);
+    check_mods[1] = "b";
+
+    before = parse_valid(state, "<ifs xmlns=\"urn:tests:a\">"
+            "<if><name>e1</name><alias>a1</alias><type>eth</type><b-cfg xmlns=\"urn:tests:b\"><speed>1000</speed>"
+            "</b-cfg></if>"
+            "<if><name>e2</name><alias>a2</alias><type>eth</type><peer-speed xmlns=\"urn:tests:b\">1000</peer-speed>"
+            "</if></ifs>");
+
+    /* e2 refers to the speed of e1, which no longer exists after the edit */
+    check_edit(state, before, "/a:ifs/if[name='e1']/b:b-cfg/speed", "1001", LY_EVALID);
+    check_edit(state, before, "/a:ifs/if[name='e2']/alias", "a9", LY_SUCCESS);
+
+    lyd_free_siblings(before);
+    aug_done();
+}
+
 int
 main(void)
 {
@@ -1742,6 +1779,7 @@ main(void)
         UTEST(test_toplevel_default),
         UTEST(test_stale_default),
         UTEST(test_stats),
+        UTEST(test_schema_change),
         UTEST(test_aug_add),
         UTEST(test_aug_delete),
         UTEST(test_aug_when_flip),
