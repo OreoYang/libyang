@@ -527,12 +527,18 @@ LIBYANG_API_DECL LY_ERR lyd_validate_module_final(struct lyd_node *tree, const s
 /**
  * @brief Validate module data incrementally, using an edit diff to skip parts the edit cannot have affected.
  *
- * Drop-in replacement for ::lyd_validate_module() that accepts and rejects exactly the same data trees.
+ * Drop-in replacement for ::lyd_validate_module() that accepts and rejects exactly the same data trees, provided
+ * @p tree was valid before the edit.
  * Every when, must, leafref and unique of the module is classified by how far the data it reads can reach;
  * list instances the edit did not touch are skipped only when that classification proves their constraints
  * cannot have changed. Anything that cannot be proven falls back to a full ::lyd_validate_module(). That includes
  * any edit after which the validation deletes a node itself (a when turned false, a default or a case replaced),
- * because what reads such a node cannot be told from @p edit_diff.
+ * because what reads such a node cannot be told from @p edit_diff, and any edit that changes what a cross-instance
+ * when of a nested default node reads, because the default can appear in list instances the edit did not touch.
+ *
+ * Data the edit does not reach is not checked again, so data that was invalid before the edit (written without
+ * validation, or validated against another schema) is not reported. Use ::lyd_validate_module() whenever the
+ * tree before the edit cannot be trusted to be valid.
  *
  * Pass @p edit_diff as NULL to validate in full. As with ::lyd_validate_module(), use ::LYD_VALIDATE_NOT_FINAL
  * and follow up with ::lyd_validate_module_incr_final() when validating several modules. In that case merge

@@ -734,6 +734,156 @@ test_stale_default(void **state)
     lyd_free_siblings(before);
 }
 
+static const char *schema_dw =
+        "module dw {\n"
+        "    namespace urn:tests:dw;\n"
+        "    prefix dw;\n"
+        "    yang-version 1.1;\n"
+        "\n"
+        "    container gate {\n"
+        "        leaf on { type string; }\n"
+        "        leaf off { type empty; }\n"
+        "        leaf mode { type string; }\n"
+        "    }\n"
+        "    container items {\n"
+        "        list item {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf limit { type uint32; }\n"
+        /* nested defaults guarded by a when on another top-level tree, checked against their own instance */
+        "            leaf speed {\n"
+        "                when \"/dw:gate/dw:on = 'yes'\";\n"
+        "                must \". <= ../limit\";\n"
+        "                type uint32;\n"
+        "                default 11;\n"
+        "            }\n"
+        "            leaf burst {\n"
+        "                when \"not(/dw:gate/dw:off)\";\n"
+        "                must \". <= ../limit\";\n"
+        "                type uint32;\n"
+        "                default 11;\n"
+        "            }\n"
+        /* the same, but the when reads only its own instance */
+        "            leaf boost {\n"
+        "                when \"../limit > 10\";\n"
+        "                must \". <= ../limit\";\n"
+        "                type uint32;\n"
+        "                default 15;\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "    container stats {\n"
+        "        config false;\n"
+        "        list s {\n"
+        "            key n;\n"
+        "            leaf n { type string; }\n"
+        "            leaf rate {\n"
+        "                when \"/dw:gate/dw:mode = 'fast'\";\n"
+        "                type uint32;\n"
+        "                default 1;\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "    leaf note { type string; }\n"
+        "}";
+
+/**
+ * @brief Validate an edited tree both ways, where the incremental run must fall back.
+ */
+static void
+check_fallback(void **state, const struct lyd_node *before, const struct lyd_node *after, LY_ERR expected)
+{
+    uint64_t fb_before = 0, fb_after = 0;
+    LY_ERR rc;
+
+    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fb_before);
+    check_same(state, before, after, 1, &rc);
+    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fb_after);
+    assert_int_equal(expected, rc);
+    assert_true(fb_after > fb_before);
+}
+
+/**
+ * @brief Validate a single edit both ways, where the incremental run must fall back.
+ */
+static void
+check_edit_fallback(void **state, const struct lyd_node *before, const char *path, const char *value,
+        LY_ERR expected)
+{
+    struct lyd_node *after = NULL;
+
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, path, value, LYD_NEW_PATH_UPDATE, NULL));
+    check_fallback(state, before, after, expected);
+    lyd_free_siblings(after);
+}
+
+/**
+ * @brief A when that reads another top-level tree turns true, so a full validation creates the default in every
+ * list instance, also in the ones the edit never touched, and checks it there.
+ */
+static void
+test_dflt_when_remote(void **state)
+{
+    struct lyd_node *before, *after = NULL, *diff = NULL;
+    const struct lys_module *mod;
+    uint64_t fb[3] = {0};
+
+    UTEST_ADD_MODULE(schema_dw, LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "dw";
+
+    before = parse_valid(state, "<gate xmlns=\"urn:tests:dw\"><on>no</on><off/></gate>"
+            "<items xmlns=\"urn:tests:dw\"><item><name>i1</name><limit>20</limit></item>"
+            "<item><name>i2</name><limit>5</limit></item></items>");
+
+    /* the default 11 fits i1 but not the limit 5 of i2 */
+    check_edit_fallback(state, before, "/dw:gate/on", "yes", LY_EVALID);
+
+    /* a delete turns a when true just as well */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    drop_node(&after, "/dw:gate/off");
+    check_fallback(state, before, after, LY_EVALID);
+    lyd_free_siblings(after);
+
+    /* a when reading its own instance turns true only in the edited one, the default 15 breaks the limit 12 */
+    check_edit(state, before, "/dw:items/item[name='i2']/limit", "12", LY_EVALID);
+    check_edit(state, before, "/dw:items/item[name='i2']/limit", "30", LY_SUCCESS);
+
+    /* edits the cross-instance whens do not read stay incremental */
+    check_edit(state, before, "/dw:items/item[name='i2']/limit", "6", LY_SUCCESS);
+    check_edit(state, before, "/dw:note", "x", LY_SUCCESS);
+
+    lyd_free_siblings(before);
+
+    /* without state data no state default is created, so its when needs no fallback */
+    mod = ly_ctx_get_module_implemented(UTEST_LYCTX, "dw");
+    assert_int_equal(LY_SUCCESS, lyd_parse_data_mem(UTEST_LYCTX,
+            "<gate xmlns=\"urn:tests:dw\"><on>no</on><off/></gate>", LYD_XML, 0,
+            LYD_VALIDATE_PRESENT | LYD_VALIDATE_NO_STATE, &before));
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, "/dw:gate/mode", "fast", 0, NULL));
+    assert_int_equal(LY_SUCCESS, lyd_diff_siblings(before, after, 0, &diff));
+    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fb[0]);
+    assert_int_equal(LY_SUCCESS, lyd_validate_module_incr(&after, mod, diff, LYD_VALIDATE_NO_STATE, NULL));
+    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fb[1]);
+    assert_int_equal(LY_SUCCESS, lyd_validate_module_incr(&after, mod, diff, 0, NULL));
+    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fb[2]);
+    assert_int_equal(fb[0], fb[1]);
+    assert_true(fb[2] > fb[1]);
+    lyd_free_siblings(diff);
+    lyd_free_siblings(after);
+    lyd_free_siblings(before);
+
+    /* every limit fits, the defaults appear everywhere */
+    before = parse_valid(state, "<gate xmlns=\"urn:tests:dw\"><on>no</on><off/></gate>"
+            "<items xmlns=\"urn:tests:dw\"><item><name>i1</name><limit>20</limit></item>"
+            "<item><name>i2</name><limit>30</limit></item></items>");
+    check_edit_fallback(state, before, "/dw:gate/on", "yes", LY_SUCCESS);
+    lyd_free_siblings(before);
+
+    check_mods[0] = "a";
+}
+
 /**
  * @brief The fallback counter has to move, otherwise a silent return to full validation is invisible.
  */
@@ -1778,6 +1928,7 @@ main(void)
         UTEST(test_random_edits),
         UTEST(test_toplevel_default),
         UTEST(test_stale_default),
+        UTEST(test_dflt_when_remote),
         UTEST(test_stats),
         UTEST(test_schema_change),
         UTEST(test_aug_add),

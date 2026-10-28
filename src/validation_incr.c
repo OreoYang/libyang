@@ -518,6 +518,40 @@ lyd_val_incr_atoms_hit(const struct lyd_val_constraint *cons, const struct ly_se
 }
 
 /**
+ * @brief Whether the edit can make a default appear in an instance the scoped passes never reach.
+ *
+ * The scoped passes create implicit nodes only on the top level, above the roots and inside them, while a full
+ * validation creates them in every instance. A cross-instance "when" of a nested implicit node that reads what the
+ * edit touched can turn true in an untouched instance, and nothing would create the default there or check it.
+ */
+static ly_bool
+lyd_val_incr_dflt_appears(const struct lyd_val_dep_index *index, const struct lyd_val_incr *incr, uint32_t val_opts)
+{
+    const struct lyd_val_constraint *cons;
+    uint32_t i;
+
+    for (i = 0; i < index->nonlocal_count; ++i) {
+        cons = &index->constraints[index->nonlocal[i]];
+        if ((cons->kind != LYD_VAL_DEP_WHEN) || !lysc_data_parent(cons->snode) ||
+                !lyd_val_deps_is_implicit(cons->snode)) {
+            continue;
+        }
+        if ((val_opts & LYD_VALIDATE_NO_STATE) && (cons->snode->flags & LYS_CONFIG_R)) {
+            /* state defaults are not created */
+            continue;
+        }
+        if (!cons->atoms || !cons->atoms[0]) {
+            /* what the "when" reads is unknown, so any edit may flip it */
+            return 1;
+        }
+        if (lyd_val_incr_atoms_hit(cons, &incr->modified) || lyd_val_incr_atoms_hit(cons, &incr->created)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief Collect the schema nodes whose cross-instance constraints the edit could have changed.
  */
 static LY_ERR
@@ -619,7 +653,7 @@ lyd_val_incr_prune_extra(struct lyd_val_incr *incr)
  */
 static LY_ERR
 lyd_val_incr_analyze(const struct lyd_node *tree, const struct lys_module *mod, const struct lyd_node *edit_diff,
-        struct lyd_val_incr *incr)
+        uint32_t val_opts, struct lyd_val_incr *incr)
 {
     const struct lyd_val_dep_index *index;
     LY_ERR rc;
@@ -639,6 +673,10 @@ lyd_val_incr_analyze(const struct lyd_node *tree, const struct lys_module *mod, 
     rc = lyd_val_incr_collect(tree, mod, index, edit_diff, incr);
     LY_CHECK_RET(rc);
     if (incr->fallback) {
+        return LY_SUCCESS;
+    }
+    if (lyd_val_incr_dflt_appears(index, incr, val_opts)) {
+        incr->fallback = 1;
         return LY_SUCCESS;
     }
     lyd_val_incr_prune_roots(incr);
@@ -944,7 +982,7 @@ lyd_val_incr_full(struct lyd_node **tree, const struct lys_module *module, uint3
     first = *first2; \
     lyd_first_module_sibling(&first, module); \
     first2 = (!first || (first == *tree)) ? tree : &first; \
-    r = lyd_val_incr_analyze(*tree, module, edit_diff, &incr); \
+    r = lyd_val_incr_analyze(*tree, module, edit_diff, val_opts, &incr); \
     LY_CHECK_ERR_GOTO(r, rc = r, cleanup); \
     if (incr.fallback) { \
         lyd_val_incr_count(module->ctx, &incr, 1); \
@@ -975,7 +1013,7 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
         return lyd_validate_module(tree, module, val_opts, diff);
     }
 
-    rc = lyd_val_incr_analyze(*tree, module, edit_diff, &incr);
+    rc = lyd_val_incr_analyze(*tree, module, edit_diff, val_opts, &incr);
     LY_CHECK_GOTO(rc, cleanup);
 
     if (incr.fallback) {
@@ -1112,7 +1150,7 @@ lyd_validate_module_incr_final(struct lyd_node *tree, const struct lys_module *m
         return lyd_validate_module_final(tree, module, val_opts);
     }
 
-    rc = lyd_val_incr_analyze(tree, module, edit_diff, &incr);
+    rc = lyd_val_incr_analyze(tree, module, edit_diff, val_opts, &incr);
     LY_CHECK_GOTO(rc, cleanup);
 
     if (!incr.fallback) {
