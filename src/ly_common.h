@@ -379,6 +379,8 @@ struct ly_ctx {
         uint64_t must_evals;          /**< "must" conditions evaluated by incremental validation */
         uint64_t must_skips;          /**< value-keyed "must" conditions the edit could not have violated */
         uint64_t late_fallbacks;      /**< fallbacks decided after the validation deleted a node itself */
+        uint64_t shallow_deletes;     /**< deleted instances whose parent was checked instead of the whole
+                                           top-level subtree */
     } val_incr_stats;
 };
 

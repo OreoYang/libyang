@@ -51,6 +51,8 @@ struct lyd_val_incr {
     const struct lyd_val_dep_index *index;  /**< dependency index of ::lyd_val_incr.mod, owned by the context */
     struct ly_set roots;        /**< data subtrees to validate in full */
     struct ly_set path;         /**< ::lyd_val_incr.roots and all their data ancestors */
+    struct ly_set shallow;      /**< parents of deleted instances that are checked instead of being scope roots,
+                                     see ::lyd_val_incr_shallow_ok(); they and their ancestors are in the path */
     struct ly_set extra;        /**< individual nodes outside the scope whose cross-instance constraints
                                      the edit could have changed */
     struct ly_set created;      /**< schema nodes the edit only created */
@@ -78,6 +80,7 @@ lyd_val_incr_erase(struct lyd_val_incr *incr)
 {
     ly_set_erase(&incr->roots, NULL);
     ly_set_erase(&incr->path, NULL);
+    ly_set_erase(&incr->shallow, NULL);
     ly_set_erase(&incr->extra, NULL);
     ly_set_erase(&incr->created, NULL);
     ly_set_erase(&incr->modified, NULL);
@@ -408,11 +411,97 @@ lyd_val_incr_add_root(struct lyd_val_incr *incr, struct lyd_node *root)
 }
 
 /**
+ * @brief Whether a deleted instance can be revalidated through the checks of its parent alone.
+ *
+ * With no list instance above the parent, the only thing a scope root at the top level adds is a full pass over the
+ * sibling instances. A rule in a sibling instance that reads the deleted one crosses a list instance that nothing
+ * confines, so the classifier made it cross-instance and the extra node search rechecks it. A rule outside every
+ * list that reads anything in the deleted subtree has its atoms in the top-level atoms, and a rule whose atoms are
+ * unknown is not found by the extra node search at all; both keep the wide scope. The parent stays on the path, so
+ * its own conditions and the number of instances are still checked by the final pass.
+ *
+ * @param[in] index Dependency index of the validated module.
+ * @param[in] diff_node Deleted node of the edit diff.
+ * @param[in] parent Data node @p diff_node was matched to, the closest one that survived.
+ * @return Whether @p parent may be checked instead of a scope root.
+ */
+static ly_bool
+lyd_val_incr_shallow_ok(const struct lyd_val_dep_index *index, const struct lyd_node *diff_node,
+        const struct lyd_node *parent)
+{
+    const struct lyd_node *iter;
+    const struct lyd_val_constraint *cons;
+    uint32_t i;
+
+    if (!(diff_node->schema->nodetype & (LYS_LIST | LYS_LEAFLIST))) {
+        return 0;
+    }
+    if (!lyd_parent(diff_node) || (lyd_parent(diff_node)->schema != parent->schema)) {
+        /* more than the instance itself is gone */
+        return 0;
+    }
+    for (iter = parent; iter; iter = lyd_parent(iter)) {
+        if (!iter->schema || (iter->schema->nodetype & (LYS_LIST | LYS_LEAFLIST))) {
+            /* a rule confined to that instance can read the deleted one without being cross-instance */
+            return 0;
+        }
+    }
+    for (i = 0; i < index->toplevel_atoms.count; ++i) {
+        if (lyd_val_incr_snode_covers(diff_node->schema, index->toplevel_atoms.snodes[i])) {
+            return 0;
+        }
+    }
+    for (i = 0; i < index->constraint_count; ++i) {
+        cons = &index->constraints[i];
+        if ((cons->kind != LYD_VAL_DEP_UNIQUE) && (!cons->atoms || !cons->atoms[0]) &&
+                lyd_val_incr_snode_covers(parent->schema, cons->snode)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/**
+ * @brief Check @p parent instead of making it a scope root, see ::lyd_val_incr_shallow_ok().
+ */
+static LY_ERR
+lyd_val_incr_add_shallow(struct lyd_val_incr *incr, struct lyd_node *parent)
+{
+    struct lyd_node *iter;
+
+    LY_CHECK_RET(ly_set_add(&incr->shallow, parent, 0, NULL));
+    for (iter = parent; iter; iter = lyd_parent(iter)) {
+        LY_CHECK_RET(ly_set_add(&incr->path, iter, 0, NULL));
+    }
+    return LY_SUCCESS;
+}
+
+/**
+ * @brief Drop shallow parents that already sit inside a scope root, the subtree walk checks them anyway.
+ */
+static void
+lyd_val_incr_prune_shallow(struct lyd_val_incr *incr)
+{
+    const struct lyd_node *iter;
+    uint32_t i = incr->shallow.count;
+
+    while (i) {
+        --i;
+        for (iter = incr->shallow.dnodes[i]; iter; iter = lyd_parent(iter)) {
+            if (ly_set_contains(&incr->roots, (void *)iter, NULL)) {
+                ly_set_rm_index(&incr->shallow, i, NULL);
+                break;
+            }
+        }
+    }
+}
+
+/**
  * @brief Turn an edit diff into the set of subtrees to revalidate and the schema nodes it touched.
  */
 static LY_ERR
 lyd_val_incr_collect(const struct lyd_node *tree, const struct lys_module *mod, const struct lyd_val_dep_index *index,
-        const struct lyd_node *edit_diff, struct lyd_val_incr *incr)
+        const struct lyd_node *edit_diff, uint32_t val_opts, struct lyd_val_incr *incr)
 {
     const struct lyd_node *dtop, *diter;
     struct lyd_node *data, *root;
@@ -462,6 +551,11 @@ lyd_val_incr_collect(const struct lyd_node *tree, const struct lys_module *mod, 
             if (!exact && (op != LYD_DIFF_OP_DELETE)) {
                 incr->fallback = 1;
                 return LY_SUCCESS;
+            }
+            if ((val_opts & LYD_VALIDATE_INCR_SHALLOW_DELETE) && (op == LYD_DIFF_OP_DELETE) && !exact &&
+                    lyd_val_incr_shallow_ok(index, diter, data)) {
+                LY_CHECK_RET(lyd_val_incr_add_shallow(incr, data));
+                goto next;
             }
 
             toplevel = ly_set_contains(&index->toplevel_atoms, (void *)diter->schema, NULL);
@@ -660,6 +754,7 @@ lyd_val_incr_analyze(const struct lyd_node *tree, const struct lys_module *mod, 
 
     ly_set_erase(&incr->roots, NULL);
     ly_set_erase(&incr->path, NULL);
+    ly_set_erase(&incr->shallow, NULL);
     lyd_val_incr_valsets_erase(incr);
     incr->mod = mod;
 
@@ -670,7 +765,7 @@ lyd_val_incr_analyze(const struct lyd_node *tree, const struct lys_module *mod, 
     }
     incr->index = index;
 
-    rc = lyd_val_incr_collect(tree, mod, index, edit_diff, incr);
+    rc = lyd_val_incr_collect(tree, mod, index, edit_diff, val_opts, incr);
     LY_CHECK_RET(rc);
     if (incr->fallback) {
         return LY_SUCCESS;
@@ -680,6 +775,7 @@ lyd_val_incr_analyze(const struct lyd_node *tree, const struct lys_module *mod, 
         return LY_SUCCESS;
     }
     lyd_val_incr_prune_roots(incr);
+    lyd_val_incr_prune_shallow(incr);
 
     return LY_SUCCESS;
 }
@@ -747,6 +843,7 @@ lyd_val_incr_stats_add(const struct ly_ctx *ctx, const struct lyd_validate_incr_
         dst[i]->must_evals += delta->must_evals;
         dst[i]->must_skips += delta->must_skips;
         dst[i]->late_fallbacks += delta->late_fallbacks;
+        dst[i]->shallow_deletes += delta->shallow_deletes;
         pthread_mutex_unlock(lock[i]);
     }
 }
@@ -762,6 +859,7 @@ lyd_val_incr_count(const struct ly_ctx *ctx, const struct lyd_val_incr *incr, ly
     } else {
         delta.scope_roots = incr->roots.count;
         delta.extra_nodes = incr->extra.count;
+        delta.shallow_deletes = incr->shallow.count;
     }
     lyd_val_incr_stats_add(ctx, &delta);
 }
@@ -820,6 +918,20 @@ lyd_validate_incr_must_stats(const struct ly_ctx *ctx, uint64_t *evals, uint64_t
     }
     if (skips) {
         *skips = stats->must_skips;
+    }
+    pthread_mutex_unlock(lock);
+}
+
+LIBYANG_API_DEF void
+lyd_validate_incr_shallow_stats(const struct ly_ctx *ctx, uint64_t *shallow_deletes)
+{
+    struct ly_ctx *c = (struct ly_ctx *)ctx;
+    pthread_mutex_t *lock = ctx ? &c->val_deps_lock : &lyd_val_incr_glob_lock;
+    const struct lyd_validate_incr_stats *stats = ctx ? &c->val_incr_stats : &lyd_val_incr_glob;
+
+    pthread_mutex_lock(lock);
+    if (shallow_deletes) {
+        *shallow_deletes = stats->shallow_deletes;
     }
     pthread_mutex_unlock(lock);
 }
@@ -999,7 +1111,7 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
     struct lyd_val_scope scope;
     struct ly_set node_types = {0}, meta_types = {0}, node_when = {0}, ext_node = {0}, ext_val = {0};
     struct ly_ht *getnext_ht = NULL;
-    struct lyd_node *first, **first2, *iter, *val_diff = NULL;
+    struct lyd_node *first, **first2, *iter, *child, *val_diff = NULL;
     uint32_t i, impl_opts;
 
     LY_CHECK_ARG_RET(NULL, tree, module, !(val_opts & LYD_VALIDATE_PRESENT), LY_EINVAL);
@@ -1068,6 +1180,20 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
         if ((iter->flags & LYD_NEW) && !ly_set_contains(&incr.roots, iter, NULL)) {
             r = lyd_val_incr_add_root(&incr, iter);
             LY_CHECK_ERR_GOTO(r, rc = r, cleanup);
+        }
+    }
+
+    /* a deleted instance can let a default or a default case appear in its parent, which no subtree walk reaches */
+    for (i = 0; i < incr.shallow.count; ++i) {
+        iter = incr.shallow.dnodes[i];
+        r = lyd_new_implicit(iter, lyd_node_child_p(iter), NULL, NULL, NULL, NULL, NULL, impl_opts, getnext_ht,
+                &val_diff);
+        LY_CHECK_ERR_GOTO(r, rc = r, cleanup);
+        LY_LIST_FOR(lyd_child(iter), child) {
+            if ((child->flags & LYD_NEW) && !ly_set_contains(&incr.roots, child, NULL)) {
+                r = lyd_val_incr_add_root(&incr, child);
+                LY_CHECK_ERR_GOTO(r, rc = r, cleanup);
+            }
         }
     }
 

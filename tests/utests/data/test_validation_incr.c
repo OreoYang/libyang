@@ -119,8 +119,14 @@ static char edit_log[4096];
 /** @brief NULL-terminated names of the modules check_same() validates, at most 4 */
 static const char *check_mods[5] = {"a", NULL, NULL, NULL, NULL};
 
+/** @brief extra options of every incremental run of check_same(), each one compared against the full run */
+static const uint32_t incr_opt_sets[] = {0, LYD_VALIDATE_INCR_SHALLOW_DELETE};
+
 /**
  * @brief Validate @p data both ways and require the two runs to agree.
+ *
+ * The incremental side runs once per ::incr_opt_sets, so every edit of every test also covers the narrow scope of
+ * deleted instances.
  *
  * @param[in] state Test state.
  * @param[in] before Tree before the edit, already valid.
@@ -137,8 +143,8 @@ check_same(void **state, const struct lyd_node *before, const struct lyd_node *a
     const struct lys_module *mods[5] = {NULL};
     char *full_str = NULL, *incr_str = NULL;
     uint64_t fallbacks_before = 0, fallbacks_after = 0;
-    uint32_t i, mod_count;
-    ly_bool self_deleted = 0;
+    uint32_t i, mod_count, s, opts;
+    ly_bool self_deleted;
     char full_msg[256], incr_msg[256];
     LY_ERR rc_full, rc_incr;
 
@@ -146,11 +152,8 @@ check_same(void **state, const struct lyd_node *before, const struct lyd_node *a
         mods[mod_count] = ly_ctx_get_module_implemented(UTEST_LYCTX, check_mods[mod_count]);
         assert_non_null(mods[mod_count]);
     }
-    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fallbacks_before);
 
-    assert_int_equal(LY_SUCCESS, lyd_diff_siblings(before, after, 0, &diff));
     assert_int_equal(LY_SUCCESS, lyd_dup_siblings(after, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &full));
-    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(after, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &incr));
 
     /* split into the two passes the same way sysrepo drives them */
     /* every module is validated, like sysrepo does for each module an edit may reach */
@@ -163,6 +166,16 @@ check_same(void **state, const struct lyd_node *before, const struct lyd_node *a
     }
     snprintf(full_msg, sizeof full_msg, "%s", ly_err_last(UTEST_LYCTX) ? ly_err_last(UTEST_LYCTX)->msg : "-");
     ly_err_clean((struct ly_ctx *)UTEST_LYCTX, NULL);
+    if (!rc_full) {
+        assert_int_equal(LY_SUCCESS, lyd_print_mem(&full_str, full, LYD_XML, LYD_PRINT_WITHSIBLINGS));
+    }
+
+    for (s = 0; s < sizeof incr_opt_sets / sizeof *incr_opt_sets; ++s) {
+    opts = incr_opt_sets[s];
+    self_deleted = 0;
+    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fallbacks_before);
+    assert_int_equal(LY_SUCCESS, lyd_diff_siblings(before, after, 0, &diff));
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(after, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &incr));
 
     /* the changes the validation makes itself (autodeleted when, new defaults) are merged into the edit diff
      * before the next module and the final pass, as sysrepo does with its notify diff */
@@ -170,7 +183,7 @@ check_same(void **state, const struct lyd_node *before, const struct lyd_node *a
     for (i = 0; !rc_incr && (i < mod_count); ++i) {
         struct lyd_node *val_diff = NULL;
 
-        rc_incr = lyd_validate_module_incr(&incr, mods[i], diff, LYD_VALIDATE_NOT_FINAL, &val_diff);
+        rc_incr = lyd_validate_module_incr(&incr, mods[i], diff, opts | LYD_VALIDATE_NOT_FINAL, &val_diff);
         if (val_diff) {
             char *val_str = NULL;
 
@@ -186,7 +199,7 @@ check_same(void **state, const struct lyd_node *before, const struct lyd_node *a
         }
     }
     for (i = 0; !rc_incr && (i < mod_count); ++i) {
-        rc_incr = lyd_validate_module_incr_final(incr, mods[i], diff, 0);
+        rc_incr = lyd_validate_module_incr_final(incr, mods[i], diff, opts);
     }
     snprintf(incr_msg, sizeof incr_msg, "%s", ly_err_last(UTEST_LYCTX) ? ly_err_last(UTEST_LYCTX)->msg : "-");
     ly_err_clean((struct ly_ctx *)UTEST_LYCTX, NULL);
@@ -195,8 +208,8 @@ check_same(void **state, const struct lyd_node *before, const struct lyd_node *a
         char *diff_str = NULL;
 
         lyd_print_mem(&diff_str, diff, LYD_XML, LYD_PRINT_WITHSIBLINGS);
-        print_message("[  MSG     ] full %d (%s) vs incremental %d (%s), diff:\n%s\n", rc_full, full_msg, rc_incr,
-                incr_msg, diff_str);
+        print_message("[  MSG     ] full %d (%s) vs incremental %d with options 0x%x (%s), diff:\n%s\n", rc_full,
+                full_msg, rc_incr, opts, incr_msg, diff_str);
         print_message("[  MSG     ] edits so far (path = last value used, not always relevant):\n%s\n", edit_log);
         free(diff_str);
     }
@@ -215,9 +228,17 @@ check_same(void **state, const struct lyd_node *before, const struct lyd_node *a
     }
 
     if (!rc_full) {
-        assert_int_equal(LY_SUCCESS, lyd_print_mem(&full_str, full, LYD_XML, LYD_PRINT_WITHSIBLINGS));
         assert_int_equal(LY_SUCCESS, lyd_print_mem(&incr_str, incr, LYD_XML, LYD_PRINT_WITHSIBLINGS));
-        assert_string_equal(full_str, incr_str);
+        /* an edit that leaves no data at all prints nothing */
+        assert_string_equal(full_str ? full_str : "", incr_str ? incr_str : "");
+    }
+
+    free(incr_str);
+    incr_str = NULL;
+    lyd_free_siblings(incr);
+    incr = NULL;
+    lyd_free_siblings(diff);
+    diff = NULL;
     }
 
     if (rc_out) {
@@ -225,10 +246,29 @@ check_same(void **state, const struct lyd_node *before, const struct lyd_node *a
     }
 
     free(full_str);
-    free(incr_str);
     lyd_free_siblings(full);
-    lyd_free_siblings(incr);
-    lyd_free_siblings(diff);
+}
+
+/**
+ * @brief Validate an accepted edit in full, so the next one starts from the tree a datastore would have stored.
+ *
+ * The stored tree carries no new flags and none of the nodes the validation drops. Chaining the raw edited tree
+ * instead lets the full run recheck nodes of earlier edits that no later diff mentions.
+ */
+static void
+settle(void **state, struct lyd_node **tree)
+{
+    const struct lys_module *mod;
+    uint32_t i;
+
+    for (i = 0; check_mods[i]; ++i) {
+        mod = ly_ctx_get_module_implemented(UTEST_LYCTX, check_mods[i]);
+        assert_int_equal(LY_SUCCESS, lyd_validate_module(tree, mod, LYD_VALIDATE_NOT_FINAL, NULL));
+    }
+    for (i = 0; check_mods[i]; ++i) {
+        mod = ly_ctx_get_module_implemented(UTEST_LYCTX, check_mods[i]);
+        assert_int_equal(LY_SUCCESS, lyd_validate_module_final(*tree, mod, 0));
+    }
 }
 
 /**
@@ -675,6 +715,7 @@ test_random_edits(void **state)
                 continue;
             }
 
+            settle(state, &after);
             lyd_free_siblings(before);
             before = after;
             after = NULL;
@@ -909,6 +950,277 @@ test_stats(void **state)
     assert_int_equal(fallbacks + 1, fallbacks2);
 
     lyd_free_siblings(after);
+    lyd_free_siblings(before);
+}
+
+/*
+ * Shallow delete coverage. Every list here sits in a top-level container with no list above it, which is where a
+ * deleted instance gets the narrow scope of LYD_VALIDATE_INCR_SHALLOW_DELETE, and each kind of rule that can see
+ * the deleted instance from outside of it appears once.
+ */
+static const char *schema_sd =
+        "module sd {\n"
+        "    namespace urn:tests:sd;\n"
+        "    prefix sd;\n"
+        "    yang-version 1.1;\n"
+        "\n"
+        "    container top {\n"
+        "        list item {\n"
+        "            key name;\n"
+        "            min-elements 1;\n"
+        "            leaf name { type string; }\n"
+        "        }\n"
+        "        leaf-list tag { type string; }\n"
+        "        container inner {\n"
+        "            list x { key name; leaf name { type string; } }\n"
+        "        }\n"
+        "        choice mode {\n"
+        "            default auto;\n"
+        "            case auto { leaf auto { type string; default \"on\"; } }\n"
+        "            case manual { list rule { key id; leaf id { type uint32; } } }\n"
+        "        }\n"
+        /* cross-instance rules of a sibling list that read the deleted instances */
+        "        list peer {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf item-ref { type leafref { path \"../../item/name\"; } }\n"
+        "            leaf tag-ref { type leafref { path \"../../tag\"; } }\n"
+        "            leaf x-ref { type leafref { path \"../../inner/x/name\"; } }\n"
+        "            leaf on {\n"
+        "                when \"../../item[name = current()/../name]\";\n"
+        "                type string;\n"
+        "            }\n"
+        "        }\n"
+        "        list guard {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            must \"count(../item) >= 2\";\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        /* a rule of the container itself, confined to no list instance */
+        "    container counted {\n"
+        "        presence \"only checked when there\";\n"
+        "        must \"count(item) >= 2\";\n"
+        "        list item { key name; leaf name { type string; } }\n"
+        "    }\n"
+        "\n"
+        /* a rule with no atoms at all, which no extra pass can find */
+        "    container blind {\n"
+        "        must \"true()\";\n"
+        "        list item { key name; leaf name { type string; } }\n"
+        "    }\n"
+        "}";
+
+static const char *sd_xml =
+        "<top xmlns=\"urn:tests:sd\">"
+        "  <item><name>i1</name></item><item><name>i2</name></item><item><name>i3</name></item>"
+        "  <tag>t1</tag><tag>t2</tag>"
+        "  <inner><x><name>x1</name></x><x><name>x2</name></x></inner>"
+        "  <rule><id>1</id></rule>"
+        "  <peer><name>i1</name><item-ref>i1</item-ref><tag-ref>t1</tag-ref><x-ref>x1</x-ref><on>yes</on></peer>"
+        "</top>"
+        "<counted xmlns=\"urn:tests:sd\"><item><name>c1</name></item><item><name>c2</name></item>"
+        "  <item><name>c3</name></item></counted>"
+        "<blind xmlns=\"urn:tests:sd\"><item><name>b1</name></item><item><name>b2</name></item></blind>";
+
+/**
+ * @brief Delete a node both ways, see check_delete(), and require the narrow scope to be taken or not.
+ */
+static void
+check_delete_shallow(void **state, const struct lyd_node *before, const char *path, LY_ERR expected, ly_bool shallow)
+{
+    uint64_t count = 0, count2 = 0;
+
+    lyd_validate_incr_shallow_stats(UTEST_LYCTX, &count);
+    check_delete(state, before, path, expected);
+    lyd_validate_incr_shallow_stats(UTEST_LYCTX, &count2);
+    if (shallow != (count2 > count)) {
+        print_message("[  MSG     ] delete %s: narrow scope expected %d, taken %d times\n", path, shallow,
+                (int)(count2 - count));
+    }
+    assert_int_equal(shallow, count2 > count);
+}
+
+/**
+ * @brief Whatever a deleted instance breaks outside of itself is still found with the narrow scope.
+ */
+static void
+test_shallow_delete(void **state)
+{
+    struct lyd_node *before, *start;
+
+    UTEST_ADD_MODULE(schema_sd, LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "sd";
+    before = parse_valid(state, sd_xml);
+
+    /* nothing refers to these */
+    check_delete_shallow(state, before, "/sd:top/item[name='i3']", LY_SUCCESS, 1);
+    check_delete_shallow(state, before, "/sd:top/tag[.='t2']", LY_SUCCESS, 1);
+    check_delete_shallow(state, before, "/sd:top/inner/x[name='x2']", LY_SUCCESS, 1);
+
+    /* the targets of leafrefs in a sibling list instance */
+    check_delete_shallow(state, before, "/sd:top/tag[.='t1']", LY_EVALID, 1);
+    check_delete_shallow(state, before, "/sd:top/inner/x[name='x1']", LY_EVALID, 1);
+
+    /* the leafref and the when of a peer both read this one */
+    check_delete_shallow(state, before, "/sd:top/item[name='i1']", LY_EVALID, 1);
+
+    /* the last instance of the manual case: the parent gets the default case back */
+    check_delete_shallow(state, before, "/sd:top/rule[id='1']", LY_SUCCESS, 1);
+
+    /* a rule of the parent container itself and a rule with no atoms keep the wide scope */
+    check_delete_shallow(state, before, "/sd:counted/item[name='c3']", LY_SUCCESS, 0);
+    check_delete_shallow(state, before, "/sd:blind/item[name='b2']", LY_SUCCESS, 0);
+
+    lyd_free_siblings(before);
+
+    /* a min-elements of the parent and a count in a sibling list instance; the tag keeps the parent from turning
+     * into an empty default container, whose diff deletes the parent itself */
+    before = parse_valid(state, "<top xmlns=\"urn:tests:sd\"><item><name>i1</name></item><tag>t</tag></top>");
+    check_delete_shallow(state, before, "/sd:top/item[name='i1']", LY_EVALID, 1);
+    lyd_free_siblings(before);
+
+    before = parse_valid(state, "<top xmlns=\"urn:tests:sd\"><item><name>i1</name></item><item><name>i2</name></item>"
+            "<guard><name>g</name></guard></top>");
+    check_delete_shallow(state, before, "/sd:top/item[name='i2']", LY_EVALID, 1);
+    lyd_free_siblings(before);
+
+    /* the rule of the parent container breaks, found by the wide scope */
+    before = parse_valid(state, "<top xmlns=\"urn:tests:sd\"><item><name>i1</name></item></top>"
+            "<counted xmlns=\"urn:tests:sd\"><item><name>c1</name></item><item><name>c2</name></item></counted>");
+    check_delete_shallow(state, before, "/sd:counted/item[name='c2']", LY_EVALID, 0);
+    lyd_free_siblings(before);
+
+    /* the when of an existing peer is not evaluated again by either validation */
+    before = parse_valid(state, "<top xmlns=\"urn:tests:sd\"><item><name>i1</name></item><item><name>i2</name></item>"
+            "<peer><name>i2</name><on>yes</on></peer></top>");
+    check_delete_shallow(state, before, "/sd:top/item[name='i2']", LY_SUCCESS, 1);
+
+    /* the peer whose when reads the item is gone with it */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &start));
+    drop_node(&start, "/sd:top/peer[name='i2']");
+    drop_node(&start, "/sd:top/item[name='i2']");
+    check_same(state, before, start, 0, NULL);
+    lyd_free_siblings(start);
+
+    /* a new peer leaf whose when reads the deleted item is dropped by the validation itself */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &start));
+    drop_node(&start, "/sd:top/peer[name='i2']");
+    drop_node(&start, "/sd:top/item[name='i2']");
+    assert_int_equal(LY_SUCCESS, lyd_new_path(start, UTEST_LYCTX, "/sd:top/peer[name='i2']/on", "yes", 0, NULL));
+    check_same(state, before, start, 0, NULL);
+    lyd_free_siblings(start);
+    lyd_free_siblings(before);
+
+    check_mods[0] = "a";
+}
+
+/**
+ * @brief Validate an edited tree in full, and incrementally against a hand-made edit diff with the narrow scope.
+ *
+ * Unlike check_same() the diff is not computed from the two trees, so it can describe the edit differently from
+ * the data, which is what a diff merged from several steps may do.
+ */
+static void
+check_diff_shallow(void **state, const struct lyd_node *after, const char *diff_xml, LY_ERR expected, ly_bool shallow)
+{
+    const struct lys_module *mod = ly_ctx_get_module_implemented(UTEST_LYCTX, "sd");
+    struct lyd_node *full = NULL, *incr = NULL, *diff = NULL, *val_diff = NULL;
+    uint64_t count = 0, count2 = 0;
+    LY_ERR rc_full, rc_incr;
+
+    assert_non_null(mod);
+
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(after, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &full));
+    rc_full = lyd_validate_module(&full, mod, 0, NULL);
+    ly_err_clean((struct ly_ctx *)UTEST_LYCTX, NULL);
+
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(after, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &incr));
+    assert_int_equal(LY_SUCCESS, lyd_parse_data_mem(UTEST_LYCTX, diff_xml, LYD_XML, LYD_PARSE_ONLY, 0, &diff));
+    lyd_validate_incr_shallow_stats(UTEST_LYCTX, &count);
+    rc_incr = lyd_validate_module_incr(&incr, mod, diff, LYD_VALIDATE_INCR_SHALLOW_DELETE | LYD_VALIDATE_NOT_FINAL,
+            &val_diff);
+    if (!rc_incr) {
+        rc_incr = lyd_validate_module_incr_final(incr, mod, diff, LYD_VALIDATE_INCR_SHALLOW_DELETE);
+    }
+    lyd_validate_incr_shallow_stats(UTEST_LYCTX, &count2);
+    ly_err_clean((struct ly_ctx *)UTEST_LYCTX, NULL);
+
+    assert_int_equal(expected, rc_full);
+    assert_int_equal(rc_full, rc_incr);
+    if (shallow != (count2 > count)) {
+        print_message("[  MSG     ] narrow scope expected %d, taken %d times\n", shallow, (int)(count2 - count));
+    }
+    assert_int_equal(shallow, count2 > count);
+
+    lyd_free_all(val_diff);
+    lyd_free_siblings(diff);
+    lyd_free_siblings(incr);
+    lyd_free_siblings(full);
+}
+
+#define SD_DIFF_NS "xmlns=\"urn:tests:sd\" xmlns:yang=\"urn:ietf:params:xml:ns:yang:1\""
+
+/**
+ * @brief The narrow scope needs the surviving node to be the direct parent of the deleted instance.
+ *
+ * A diff that deletes an instance two levels below the node that still exists describes more missing data than the
+ * parent checks look at, so it keeps the wide scope. The same delete one level below a surviving parent does not.
+ */
+static void
+test_shallow_levels(void **state)
+{
+    struct lyd_node *before, *after = NULL;
+
+    UTEST_ADD_MODULE(schema_sd, LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "sd";
+    before = parse_valid(state, sd_xml);
+
+    /* the surviving node is the parent: top/inner exists, only x1 is gone; the peer that refers to x1 is found */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    drop_node(&after, "/sd:top/inner/x[name='x1']");
+    check_diff_shallow(state, after, "<top " SD_DIFF_NS " yang:operation=\"none\"><inner yang:operation=\"none\">"
+            "<x yang:operation=\"delete\"><name>x1</name></x></inner></top>", LY_EVALID, 1);
+    lyd_free_siblings(after);
+    after = NULL;
+
+    /* the same instance, but the diff places it below an inner node that is not in the data: the surviving node is
+     * top, two levels above the deleted instance */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    drop_node(&after, "/sd:top/inner");
+    check_diff_shallow(state, after, "<top " SD_DIFF_NS " yang:operation=\"none\"><inner yang:operation=\"none\">"
+            "<x yang:operation=\"delete\"><name>x1</name></x></inner></top>", LY_EVALID, 0);
+    lyd_free_siblings(after);
+
+    lyd_free_siblings(before);
+    check_mods[0] = "a";
+}
+
+/**
+ * @brief Only list and leaf-list instances with no list instance above them get the narrow scope.
+ */
+static void
+test_shallow_gate(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(schema_a, LYS_IN_YANG, NULL, NULL);
+    before = parse_valid(state, base_xml);
+
+    /* the leafref of a service still finds the deleted interface, and the top-level default with a when is checked
+     * as an extra node whatever the scope is */
+    check_delete_shallow(state, before, "/a:ifs/if[name='e1']", LY_EVALID, 1);
+
+    /* a port has a forwarder instance above it */
+    check_delete_shallow(state, before, "/a:fwds/fwd[name='f2']/ports/port[name='p3']", LY_SUCCESS, 0);
+
+    /* a whole forwarder has none */
+    check_delete_shallow(state, before, "/a:fwds/fwd[name='f2']", LY_SUCCESS, 1);
+
+    /* the only service leaves an empty default container, so the diff deletes the container instead */
+    check_delete_shallow(state, before, "/a:svcs/svc[name='s1']", LY_SUCCESS, 0);
+
     lyd_free_siblings(before);
 }
 
@@ -1862,6 +2174,7 @@ test_aug_random_edits(void **state)
                 continue;
             }
 
+            settle(state, &after);
             lyd_free_siblings(before);
             before = after;
             after = NULL;
@@ -1911,6 +2224,783 @@ test_schema_change(void **state)
     aug_done();
 }
 
+/*
+ * Delete coverage. A deletion breaks something in one of three ways: a rule elsewhere reads the deleted data (a
+ * leafref, a must or a when, in the same or in another module), a rule of the surviving structure no longer holds
+ * (min-elements, mandatory, a choice, a default, an emptied container), or the shape of the edit itself hides the
+ * delete (several nodes at once, a delete next to a create, a whole top-level instance, module order). Module dl
+ * holds every kind of reader and structure once, module dm reads and augments dl from outside.
+ */
+static const char *schema_dl =
+        "module dl {\n"
+        "    namespace urn:tests:dl;\n"
+        "    prefix dl;\n"
+        "    yang-version 1.1;\n"
+        "\n"
+        "    container top {\n"
+        /* the data the readers look at */
+        "        list item {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf val { type string; }\n"
+        "            leaf dd { type string; default \"d\"; }\n"
+        "        }\n"
+        "        leaf-list tag { type string; }\n"
+        "        leaf-list num { type uint32; }\n"
+        "        list ou {\n"
+        "            ordered-by user;\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "        }\n"
+        "        container inner {\n"
+        "            leaf a { type string; }\n"
+        "            list x { key name; leaf name { type string; } }\n"
+        "        }\n"
+        "        list kr {\n"
+        "            key k;\n"
+        "            leaf k { type leafref { path \"../../item/name\"; } }\n"
+        "        }\n"
+        "        list wr {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf wref { type leafref { path \"../../r/w-on\"; } }\n"
+        "        }\n"
+        /* a when on a case, and a leafref into the case */
+        "        choice wc {\n"
+        "            case wcase {\n"
+        "                when \"item[name = 'gate']\";\n"
+        "                leaf wc-v { type string; }\n"
+        "            }\n"
+        "            case oc { leaf oc-v { type string; } }\n"
+        "        }\n"
+        "        leaf wcr { type leafref { path \"../wc-v\"; } }\n"
+        /* one reader per leaf, so one data instance exercises one rule */
+        "        list r {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf sel { type string; }\n"
+        "            leaf lref { type leafref { path \"../../item/name\"; } }\n"
+        "            leaf tref { type leafref { path \"../../tag\"; } }\n"
+        "            leaf uref {\n"
+        "                type union {\n"
+        "                    type leafref { path \"../../item/name\"; }\n"
+        "                    type enumeration { enum none; }\n"
+        "                }\n"
+        "            }\n"
+        "            leaf-list lrefs { type leafref { path \"../../item/name\"; } }\n"
+        "            leaf dref { type leafref { path \"../../item[name = current()/../sel]/val\"; } }\n"
+        "            leaf m-exist { type string; must \"../../item[name = current()/../sel]\"; }\n"
+        "            leaf m-val { type string; must \"../../item[name = current()/../sel]/val = 'good'\"; }\n"
+        "            leaf m-count { type string; must \"count(../../item) >= 2\"; }\n"
+        "            leaf m-sum { type string; must \"sum(../../num) >= 5\"; }\n"
+        "            leaf m-first { type string; must \"contains(../../item/val, 'k')\"; }\n"
+        "            leaf m-ou1 { type string; must \"../../ou[1]/name = 'first'\"; }\n"
+        "            leaf m-oul { type string; must \"../../ou[last()]/name = 'tail'\"; }\n"
+        "            leaf m-dd { type string; must \"../../item[name = 'i1']/dd = 'z'\"; }\n"
+        "            leaf m-np { type string; must \"/dl:c-np/dl:l\"; }\n"
+        /* these two read a container, which is an ancestor of what the edit deletes */
+        "            leaf m-anc { type string; must \"contains(string(../../inner), 'x1')\"; }\n"
+        "            leaf m-anc2 { type string; must \"count(../../inner/*) >= 3\"; }\n"
+        "            leaf m-anc3 { type string; must \"not(contains(string(../../inner), 'bad'))\"; }\n"
+        "            leaf w-on { type string; when \"../../item[name = 'gate']\"; }\n"
+        /* defaults that exist only while their when holds: one reads the deleted instance, the other reads w-on,
+         * which the validation itself drops once the gate is gone */
+        "            leaf dgate { type string; default \"d\"; when \"../../item[name = 'gate']\"; }\n"
+        "            leaf dw { type string; default \"d\"; when \"../w-on\"; }\n"
+        "            leaf dopen { type string; default \"d\"; when \"not(../../item[name = 'gate'])\"; }\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        /* what the surviving structure demands */
+        "    container c-mn { presence \"p\"; leaf keep { type string; } list mn { min-elements 2; key name; leaf name { type string; } } }\n"
+        "    container c-mt { presence \"p\"; leaf keep { type string; } leaf-list mt { min-elements 1; type string; } }\n"
+        "    container c-mp { presence \"p\"; leaf m { type string; mandatory true; } list l { key name; leaf name { type string; } } }\n"
+        "    container c-mc {\n"
+        "        presence \"p\";\n"
+        "        leaf keep { type string; }\n"
+        "        choice k {\n"
+        "            mandatory true;\n"
+        "            case ca { list la { key name; leaf name { type string; } } }\n"
+        "            case cb { leaf-list lb { type string; } }\n"
+        "        }\n"
+        "    }\n"
+        "    container c-dc {\n"
+        "        leaf keep { type string; }\n"
+        "        choice mode {\n"
+        "            default auto;\n"
+        "            case auto { leaf auto { type string; default \"on\"; } }\n"
+        "            case manual { list rule { key id; leaf id { type uint32; } } }\n"
+        "        }\n"
+        "    }\n"
+        "    container c-pc { presence \"p\"; list l { key name; leaf name { type string; } } }\n"
+        "    container c-np { list l { key name; leaf name { type string; } } }\n"
+        "    container c-vk {\n"
+        "        list vk {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf grp { type string; must \"count(../../vk[grp = current()]) >= 2\"; }\n"
+        "        }\n"
+        "    }\n"
+        /* rules a deletion can never break */
+        "    container c-neg {\n"
+        "        list un { key name; unique u; max-elements 3; leaf name { type string; } leaf u { type string; } }\n"
+        "        leaf-list mx { max-elements 3; type string; }\n"
+        "    }\n"
+        "    container lone { list li { key name; leaf name { type string; } } }\n"
+        "    container st {\n"
+        "        config false;\n"
+        "        list s { key name; leaf name { type string; } leaf sref { type leafref { path \"/dl:top/dl:item/dl:name\"; } } }\n"
+        "    }\n"
+        "}";
+
+static const char *schema_dm =
+        "module dm {\n"
+        "    namespace urn:tests:dm;\n"
+        "    prefix dm;\n"
+        "    yang-version 1.1;\n"
+        "    import dl { prefix dl; }\n"
+        "\n"
+        "    container mtop {\n"
+        "        list mr {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf iref { type leafref { path \"/dl:top/dl:item/dl:name\"; } }\n"
+        "            leaf lone-ref { type leafref { path \"/dl:lone/dl:li/dl:name\"; } }\n"
+        "            leaf mcnt { type string; must \"count(/dl:top/dl:tag) >= 1\"; }\n"
+        "            leaf manc { type string; must \"contains(string(/dl:top/dl:inner), 'x1')\"; }\n"
+        "            leaf manc2 { type string; must \"not(contains(string(/dl:top/dl:inner), 'bad'))\"; }\n"
+        "        }\n"
+        "    }\n"
+        /* a leaf of dm inside a list instance of dl, reading data of dl */
+        "    augment \"/dl:top/dl:item\" {\n"
+        "        leaf aug-ref { type leafref { path \"/dl:top/dl:tag\"; } }\n"
+        "    }\n"
+        "}";
+
+#define DL_T(x) "<top xmlns=\"urn:tests:dl\">" x "</top>"
+#define DL_C(c, x) "<" c " xmlns=\"urn:tests:dl\">" x "</" c ">"
+#define DL_I(n, v) "<item><name>" n "</name><val>" v "</val></item>"
+#define DL_R(n, x) "<r><name>" n "</name>" x "</r>"
+#define DL_GATE "<item><name>gate</name></item>"
+#define DM_M(x) "<mtop xmlns=\"urn:tests:dm\"><mr><name>m1</name>" x "</mr></mtop>"
+#define DL_LONE DL_C("lone", "<li><name>l1</name></li>")
+
+/** @brief every reader and every structure once, valid as a whole */
+static const char *dl_xml =
+        DL_T(
+        "<item><name>i1</name><val>k1</val><dd>z</dd></item>" DL_I("i2", "good") DL_I("i3", "zz")
+        "<item><name>i4</name><val>zz</val><aug-ref xmlns=\"urn:tests:dm\">t2</aug-ref></item>" DL_GATE
+        "<tag>t1</tag><tag>t2</tag><num>3</num><num>4</num>"
+        "<ou><name>first</name></ou><ou><name>mid</name></ou><ou><name>tail</name></ou>"
+        "<inner><a>a</a><x><name>x1</name></x><x><name>x2</name></x></inner>"
+        "<kr><k>i3</k></kr>"
+        "<wc-v>cv</wc-v><wcr>cv</wcr>"
+        DL_R("r-lref", "<lref>i1</lref>")
+        DL_R("r-tref", "<tref>t1</tref>")
+        DL_R("r-uref", "<uref>i2</uref>")
+        DL_R("r-lrefs", "<lrefs>i2</lrefs><lrefs>i3</lrefs>")
+        DL_R("r-dref", "<sel>i2</sel><dref>good</dref>")
+        DL_R("r-mexist", "<sel>i3</sel><m-exist>y</m-exist>")
+        DL_R("r-mval", "<sel>i2</sel><m-val>y</m-val>")
+        DL_R("r-mcount", "<m-count>y</m-count>")
+        DL_R("r-msum", "<m-sum>y</m-sum>")
+        DL_R("r-mfirst", "<m-first>y</m-first>")
+        DL_R("r-mou1", "<m-ou1>y</m-ou1>")
+        DL_R("r-moul", "<m-oul>y</m-oul>")
+        DL_R("r-mdd", "<m-dd>y</m-dd>")
+        DL_R("r-mnp", "<m-np>y</m-np>")
+        DL_R("r-manc", "<m-anc>y</m-anc>")
+        DL_R("r-manc2", "<m-anc2>y</m-anc2>")
+        DL_R("r-won", "<w-on>v1</w-on>")
+        "<wr><name>w1</name><wref>v1</wref></wr>")
+        DL_C("c-mn", "<keep>k</keep><mn><name>m1</name></mn><mn><name>m2</name></mn>")
+        DL_C("c-mt", "<keep>k</keep><mt>t</mt>")
+        DL_C("c-mp", "<m>x</m><l><name>a</name></l>")
+        DL_C("c-mc", "<keep>k</keep><la><name>a1</name></la><la><name>a2</name></la>")
+        DL_C("c-dc", "<keep>k</keep><rule><id>1</id></rule><rule><id>2</id></rule>")
+        DL_C("c-pc", "<l><name>a</name></l>")
+        DL_C("c-np", "<l><name>a</name></l><l><name>b</name></l>")
+        DL_C("c-vk", "<vk><name>v1</name><grp>g1</grp></vk><vk><name>v2</name><grp>g1</grp></vk>"
+        "<vk><name>v3</name><grp>g2</grp></vk><vk><name>v4</name><grp>g2</grp></vk>")
+        DL_C("c-neg", "<un><name>a</name><u>u1</u></un><un><name>b</name><u>u2</u></un><mx>x</mx><mx>y</mx>")
+        DL_LONE
+        DL_C("st", "<s><name>n1</name><sref>i2</sref></s>")
+        "<mtop xmlns=\"urn:tests:dm\"><mr><name>m1</name><iref>i1</iref></mr>"
+        "<mr><name>m2</name><lone-ref>l1</lone-ref></mr><mr><name>m3</name><mcnt>y</mcnt></mr></mtop>";
+
+static void
+dl_setup(void **state)
+{
+    UTEST_ADD_MODULE(schema_dl, LYS_IN_YANG, NULL, NULL);
+    UTEST_ADD_MODULE(schema_dm, LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "dl";
+    check_mods[1] = "dm";
+    check_mods[2] = NULL;
+}
+
+static void
+dl_done(void)
+{
+    check_mods[0] = "a";
+    check_mods[1] = NULL;
+}
+
+/**
+ * @brief Validate an edited tree in full, and incrementally against a hand-made edit diff, for both option sets.
+ *
+ * A deleted list instance that a hand-made or merged diff names without its children has to find the rules that
+ * read those children as well.
+ */
+static void
+check_diff_dl(void **state, const struct lyd_node *after, const char *diff_xml, LY_ERR expected)
+{
+    const struct lys_module *mod = ly_ctx_get_module_implemented(UTEST_LYCTX, "dl");
+    struct lyd_node *full = NULL, *incr = NULL, *diff = NULL, *val_diff = NULL;
+    LY_ERR rc_full, rc_incr;
+    uint32_t s;
+
+    assert_non_null(mod);
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(after, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &full));
+    rc_full = lyd_validate_module(&full, mod, 0, NULL);
+    ly_err_clean((struct ly_ctx *)UTEST_LYCTX, NULL);
+    assert_int_equal(expected, rc_full);
+
+    for (s = 0; s < sizeof incr_opt_sets / sizeof *incr_opt_sets; ++s) {
+        assert_int_equal(LY_SUCCESS, lyd_dup_siblings(after, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &incr));
+        assert_int_equal(LY_SUCCESS, lyd_parse_data_mem(UTEST_LYCTX, diff_xml, LYD_XML, LYD_PARSE_ONLY, 0, &diff));
+        rc_incr = lyd_validate_module_incr(&incr, mod, diff, incr_opt_sets[s] | LYD_VALIDATE_NOT_FINAL, &val_diff);
+        if (!rc_incr) {
+            rc_incr = lyd_validate_module_incr_final(incr, mod, diff, incr_opt_sets[s]);
+        }
+        ly_err_clean((struct ly_ctx *)UTEST_LYCTX, NULL);
+        if (rc_full != rc_incr) {
+            print_message("[  MSG     ] full %d vs incremental %d with options 0x%x\n", rc_full, rc_incr,
+                    incr_opt_sets[s]);
+        }
+        assert_int_equal(rc_full, rc_incr);
+
+        lyd_free_all(val_diff);
+        val_diff = NULL;
+        lyd_free_siblings(diff);
+        diff = NULL;
+        lyd_free_siblings(incr);
+        incr = NULL;
+    }
+    lyd_free_siblings(full);
+}
+
+#define DL_DIFF_NS "xmlns=\"urn:tests:dl\" xmlns:yang=\"urn:ietf:params:xml:ns:yang:1\""
+
+/**
+ * @brief A diff that deletes a list instance and does not list its children.
+ */
+static void
+test_del_childless_diff(void **state)
+{
+    struct lyd_node *before, *after;
+
+    dl_setup(state);
+
+    /* the first value is gone with the instance that held it */
+    before = parse_valid(state, DL_T(DL_I("i1", "k1") DL_I("i2", "zz") DL_R("r", "<m-first>y</m-first>")));
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    drop_node(&after, "/dl:top/item[name='i1']");
+    check_diff_dl(state, after, "<top " DL_DIFF_NS " yang:operation=\"none\"><item yang:operation=\"delete\">"
+            "<name>i1</name></item></top>", LY_EVALID);
+    lyd_free_siblings(after);
+    lyd_free_siblings(before);
+
+    /* the value a must reads is a child of the deleted instance */
+    before = parse_valid(state, DL_T("<item><name>i1</name><dd>z</dd></item>" DL_I("i2", "b")
+            DL_R("r", "<m-dd>y</m-dd>")));
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    drop_node(&after, "/dl:top/item[name='i1']");
+    check_diff_dl(state, after, "<top " DL_DIFF_NS " yang:operation=\"none\"><item yang:operation=\"delete\">"
+            "<name>i1</name></item></top>", LY_EVALID);
+    lyd_free_siblings(after);
+    lyd_free_siblings(before);
+
+    /* an unrelated instance, with the same shape of diff, is fine */
+    before = parse_valid(state, DL_T(DL_I("i1", "k1") DL_I("i2", "k2") DL_R("r", "<m-first>y</m-first>")));
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    drop_node(&after, "/dl:top/item[name='i2']");
+    check_diff_dl(state, after, "<top " DL_DIFF_NS " yang:operation=\"none\"><item yang:operation=\"delete\">"
+            "<name>i2</name></item></top>", LY_SUCCESS);
+    lyd_free_siblings(after);
+    lyd_free_siblings(before);
+
+    dl_done();
+}
+
+/** @brief seeds of the random delete sets, LY_DEL_SWEEP_SEEDS raises it for a longer run */
+static uint32_t
+dl_sweep_seeds(void)
+{
+    const char *env = getenv("LY_DEL_SWEEP_SEEDS");
+
+    return env ? (uint32_t)strtoul(env, NULL, 10) : 2000;
+}
+
+#define DL_SWEEP_SEEDS dl_sweep_seeds()
+
+/**
+ * @brief One delete edit with the verdict it must get.
+ *
+ * @p edits is in the format of aug_apply(): a path starting with '-' deletes it, any other path is set to the
+ * value next to it, and a NULL path ends the list.
+ */
+struct dl_case {
+    const char *name;
+    const char *xml;
+    const char *edits[9];
+    LY_ERR expected;
+};
+
+#define DL_P "/dl:top/"
+#define E_BAD LY_EVALID
+#define E_OK LY_SUCCESS
+
+static const struct dl_case dl_cases[] = {
+    /* leafrefs: the one the deleted instance is the target of, and one it is not */
+    {"leafref target", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r", "<lref>i1</lref>")),
+        {"-" DL_P "item[name='i1']"}, E_BAD},
+    {"leafref other instance", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r", "<lref>i1</lref>")),
+        {"-" DL_P "item[name='i2']"}, E_OK},
+    {"leafref to a leaf-list instance", DL_T("<tag>t1</tag><tag>t2</tag>" DL_R("r", "<tref>t1</tref>")),
+        {"-" DL_P "tag[.='t1']"}, E_BAD},
+    {"leafref to another leaf-list instance", DL_T("<tag>t1</tag><tag>t2</tag>" DL_R("r", "<tref>t1</tref>")),
+        {"-" DL_P "tag[.='t2']"}, E_OK},
+    {"union leafref member", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r", "<uref>i1</uref>")),
+        {"-" DL_P "item[name='i1']"}, E_BAD},
+    {"union enum member", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r", "<uref>none</uref>")),
+        {"-" DL_P "item[name='i1']"}, E_OK},
+    {"key leafref", DL_T(DL_I("i1", "a") DL_I("i2", "b") "<kr><k>i1</k></kr>"),
+        {"-" DL_P "item[name='i1']"}, E_BAD},
+    {"leaf-list of leafrefs, one target", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r", "<lrefs>i1</lrefs><lrefs>i2</lrefs>")),
+        {"-" DL_P "item[name='i2']"}, E_BAD},
+    {"leaf-list of leafrefs, not a target", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_I("i3", "c")
+        DL_R("r", "<lrefs>i1</lrefs><lrefs>i2</lrefs>")), {"-" DL_P "item[name='i3']"}, E_OK},
+    {"leafref picked by current(), the instance", DL_T(DL_I("i1", "a") DL_I("i2", "good")
+        DL_R("r", "<sel>i2</sel><dref>good</dref>")), {"-" DL_P "item[name='i2']"}, E_BAD},
+    {"leafref picked by current(), the target leaf", DL_T(DL_I("i1", "a") DL_I("i2", "good")
+        DL_R("r", "<sel>i2</sel><dref>good</dref>")), {"-" DL_P "item[name='i2']/val"}, E_BAD},
+    {"leafref picked by current(), another instance", DL_T(DL_I("i1", "a") DL_I("i2", "good")
+        DL_R("r", "<sel>i2</sel><dref>good</dref>")), {"-" DL_P "item[name='i1']"}, E_OK},
+
+    /* must: existence, value, counts, the first node, positions */
+    {"must needs the instance", DL_T(DL_I("i1", "a") DL_I("i3", "c") DL_R("r", "<sel>i3</sel><m-exist>y</m-exist>")),
+        {"-" DL_P "item[name='i3']"}, E_BAD},
+    {"must needs the instance, another one goes", DL_T(DL_I("i1", "a") DL_I("i3", "c")
+        DL_R("r", "<sel>i3</sel><m-exist>y</m-exist>")), {"-" DL_P "item[name='i1']"}, E_OK},
+    {"must compares the value", DL_T(DL_I("i2", "good") DL_R("r", "<sel>i2</sel><m-val>y</m-val>") "<tag>t</tag>"),
+        {"-" DL_P "item[name='i2']"}, E_BAD},
+    {"count falls below the bound", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r", "<m-count>y</m-count>")),
+        {"-" DL_P "item[name='i1']"}, E_BAD},
+    {"count stays above the bound", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_I("i3", "c") DL_R("r", "<m-count>y</m-count>")),
+        {"-" DL_P "item[name='i1']"}, E_OK},
+    {"sum falls below the bound", DL_T("<num>3</num><num>4</num>" DL_R("r", "<m-sum>y</m-sum>")),
+        {"-" DL_P "num[.='3']"}, E_BAD},
+    {"sum stays above the bound", DL_T("<num>3</num><num>4</num><num>5</num>" DL_R("r", "<m-sum>y</m-sum>")),
+        {"-" DL_P "num[.='5']"}, E_OK},
+    {"first node changes the string value", DL_T(DL_I("i1", "k1") DL_I("i2", "zz") DL_R("r", "<m-first>y</m-first>")),
+        {"-" DL_P "item[name='i1']"}, E_BAD},
+    {"first node changes but the value holds", DL_T(DL_I("i1", "k1") DL_I("i2", "k2") DL_R("r", "<m-first>y</m-first>")),
+        {"-" DL_P "item[name='i1']"}, E_OK},
+    {"a later node goes, the first one stays", DL_T(DL_I("i1", "k1") DL_I("i2", "zz") DL_R("r", "<m-first>y</m-first>")),
+        {"-" DL_P "item[name='i2']"}, E_OK},
+    {"first of an ordered-by-user list goes", DL_T("<ou><name>first</name></ou><ou><name>mid</name></ou>"
+        "<ou><name>tail</name></ou>" DL_R("r", "<m-ou1>y</m-ou1>")), {"-" DL_P "ou[name='first']"}, E_BAD},
+    {"middle of an ordered-by-user list goes", DL_T("<ou><name>first</name></ou><ou><name>mid</name></ou>"
+        "<ou><name>tail</name></ou>" DL_R("r", "<m-ou1>y</m-ou1>")), {"-" DL_P "ou[name='mid']"}, E_OK},
+    {"last of an ordered-by-user list goes", DL_T("<ou><name>first</name></ou><ou><name>mid</name></ou>"
+        "<ou><name>tail</name></ou>" DL_R("r", "<m-oul>y</m-oul>")), {"-" DL_P "ou[name='tail']"}, E_BAD},
+    {"middle goes, the last one stays", DL_T("<ou><name>first</name></ou><ou><name>mid</name></ou>"
+        "<ou><name>tail</name></ou>" DL_R("r", "<m-oul>y</m-oul>")), {"-" DL_P "ou[name='mid']"}, E_OK},
+
+    /* when: becoming false takes the node away, becoming true brings a default in */
+    {"when turns true to false", DL_T(DL_GATE DL_R("r", "<w-on>v1</w-on>")), {"-" DL_P "item[name='gate']"}, E_OK},
+    {"when turns false, a leafref reads the dropped node", DL_T(DL_GATE DL_R("r", "<w-on>v1</w-on>")
+        "<wr><name>w1</name><wref>v1</wref></wr>"), {"-" DL_P "item[name='gate']"}, E_BAD},
+    {"when turns false to true, a default appears", DL_T(DL_GATE DL_R("r", "<sel>x</sel>")),
+        {"-" DL_P "item[name='gate']"}, E_OK},
+    {"default node whose when reads the deleted instance", DL_T(DL_GATE DL_R("r", "<sel>x</sel>")),
+        {"-" DL_P "item[name='gate']"}, E_OK},
+    {"default node whose when reads a node the validation drops", DL_T(DL_GATE DL_R("r", "<w-on>v1</w-on>")),
+        {"-" DL_P "item[name='gate']"}, E_OK},
+    {"when of a case turns false", DL_T(DL_GATE "<wc-v>cv</wc-v>") DL_LONE, {"-" DL_P "item[name='gate']"}, E_OK},
+    {"when of a case turns false, a leafref reads it", DL_T(DL_GATE "<wc-v>cv</wc-v><wcr>cv</wcr>"),
+        {"-" DL_P "item[name='gate']"}, E_BAD},
+
+    /* the reader is in another module, or the data is */
+    {"other module leafref", DL_T(DL_I("i1", "a") DL_I("i2", "b")) DM_M("<iref>i1</iref>"),
+        {"-" DL_P "item[name='i1']"}, E_BAD},
+    {"other module leafref, another instance", DL_T(DL_I("i1", "a") DL_I("i2", "b")) DM_M("<iref>i1</iref>"),
+        {"-" DL_P "item[name='i2']"}, E_OK},
+    {"other module leafref to a top-level list", DL_LONE DL_T(DL_I("i1", "a")) DM_M("<lone-ref>l1</lone-ref>"),
+        {"-/dl:lone/li[name='l1']"}, E_BAD},
+    {"other module leafref to a whole top-level container", DL_LONE DL_T(DL_I("i1", "a")) DM_M("<lone-ref>l1</lone-ref>"),
+        {"-/dl:lone"}, E_BAD},
+    {"a top-level container nobody reads", DL_LONE DL_T(DL_I("i1", "a")), {"-/dl:lone"}, E_OK},
+    {"other module count", DL_T("<tag>t1</tag>") DM_M("<mcnt>y</mcnt>"), {"-" DL_P "tag[.='t1']"}, E_BAD},
+    {"other module count, one left", DL_T("<tag>t1</tag><tag>t2</tag>") DM_M("<mcnt>y</mcnt>"),
+        {"-" DL_P "tag[.='t1']"}, E_OK},
+    {"augmented leaf reads the deleted instance", DL_T("<tag>t1</tag><tag>t2</tag><item><name>i1</name>"
+        "<aug-ref xmlns=\"urn:tests:dm\">t1</aug-ref></item>"), {"-" DL_P "tag[.='t1']"}, E_BAD},
+    {"augmented list instance is the one deleted", DL_T("<tag>t1</tag><item><name>i1</name>"
+        "<aug-ref xmlns=\"urn:tests:dm\">t1</aug-ref></item>" DL_I("i2", "b")), {"-" DL_P "item[name='i1']"}, E_OK},
+    {"a whole top-level container read from outside", DL_LONE DL_T(DL_I("i1", "a")) DM_M("<iref>i1</iref>"),
+        {"-/dl:top"}, E_BAD},
+    {"the reader of that container goes with it", DL_LONE DL_T(DL_I("i1", "a")) DM_M("<iref>i1</iref>"),
+        {"-/dl:top", NULL, "-/dm:mtop"}, E_OK},
+    {"state data reads the deleted instance", DL_T(DL_I("i1", "a") DL_I("i2", "b"))
+        DL_C("st", "<s><name>n1</name><sref>i2</sref></s>"), {"-" DL_P "item[name='i2']"}, E_BAD},
+
+    /* what the surviving structure demands */
+    {"min-elements of a list", DL_C("c-mn", "<keep>k</keep><mn><name>m1</name></mn><mn><name>m2</name></mn>"),
+        {"-/dl:c-mn/mn[name='m1']"}, E_BAD},
+    {"min-elements of a list, enough left", DL_C("c-mn", "<keep>k</keep><mn><name>m1</name></mn><mn><name>m2</name></mn>"
+        "<mn><name>m3</name></mn>"), {"-/dl:c-mn/mn[name='m1']"}, E_OK},
+    {"min-elements of a leaf-list", DL_C("c-mt", "<keep>k</keep><mt>t</mt>"), {"-/dl:c-mt/mt[.='t']"}, E_BAD},
+    {"min-elements of a leaf-list, enough left", DL_C("c-mt", "<keep>k</keep><mt>t</mt><mt>u</mt>"),
+        {"-/dl:c-mt/mt[.='t']"}, E_OK},
+    {"mandatory leaf", DL_C("c-mp", "<m>x</m><l><name>a</name></l>"), {"-/dl:c-mp/m"}, E_BAD},
+    {"list next to a mandatory leaf", DL_C("c-mp", "<m>x</m><l><name>a</name></l>"), {"-/dl:c-mp/l[name='a']"}, E_OK},
+    {"mandatory choice loses its only node", DL_C("c-mc", "<keep>k</keep><la><name>a1</name></la>"),
+        {"-/dl:c-mc/la[name='a1']"}, E_BAD},
+    {"mandatory choice keeps a node", DL_C("c-mc", "<keep>k</keep><la><name>a1</name></la><la><name>a2</name></la>"),
+        {"-/dl:c-mc/la[name='a1']"}, E_OK},
+    {"default case comes back", DL_C("c-dc", "<keep>k</keep><rule><id>1</id></rule>"), {"-/dl:c-dc/rule[id='1']"}, E_OK},
+    {"default case does not come back", DL_C("c-dc", "<keep>k</keep><rule><id>1</id></rule><rule><id>2</id></rule>"),
+        {"-/dl:c-dc/rule[id='1']"}, E_OK},
+    {"both rules of the other case go", DL_C("c-dc", "<keep>k</keep><rule><id>1</id></rule><rule><id>2</id></rule>"),
+        {"-/dl:c-dc/rule[id='1']", NULL, "-/dl:c-dc/rule[id='2']"}, E_OK},
+    {"presence container is emptied", DL_C("c-pc", "<l><name>a</name></l>") DL_LONE, {"-/dl:c-pc/l[name='a']"}, E_OK},
+    {"non-presence container is emptied and a rule reads it", DL_C("c-np", "<l><name>a</name></l>")
+        DL_T(DL_R("r", "<m-np>y</m-np>")), {"-/dl:c-np/l[name='a']"}, E_BAD},
+    {"non-presence container is emptied, nothing reads it", DL_C("c-np", "<l><name>a</name></l>") DL_LONE,
+        {"-/dl:c-np/l[name='a']"}, E_OK},
+    {"non-presence container keeps one", DL_C("c-np", "<l><name>a</name></l><l><name>b</name></l>")
+        DL_T(DL_R("r", "<m-np>y</m-np>")), {"-/dl:c-np/l[name='a']"}, E_OK},
+    {"explicit value goes back to its default", DL_T("<item><name>i1</name><dd>z</dd></item>"
+        DL_R("r", "<m-dd>y</m-dd>")), {"-" DL_P "item[name='i1']/dd"}, E_BAD},
+    {"explicit value goes back to its default, nobody reads it", DL_T("<item><name>i1</name><dd>z</dd></item>"),
+        {"-" DL_P "item[name='i1']/dd"}, E_OK},
+    {"count of one value breaks its partner", DL_C("c-vk", "<vk><name>v1</name><grp>g1</grp></vk>"
+        "<vk><name>v2</name><grp>g1</grp></vk>"), {"-/dl:c-vk/vk[name='v1']"}, E_BAD},
+    {"count of one value keeps enough", DL_C("c-vk", "<vk><name>v1</name><grp>g1</grp></vk>"
+        "<vk><name>v2</name><grp>g1</grp></vk><vk><name>v3</name><grp>g1</grp></vk>"), {"-/dl:c-vk/vk[name='v1']"}, E_OK},
+    {"unique and max-elements never break", DL_C("c-neg", "<un><name>a</name><u>u1</u></un><un><name>b</name><u>u2</u></un>"
+        "<mx>x</mx><mx>y</mx>"), {"-/dl:c-neg/un[name='a']"}, E_OK},
+    {"max-elements never breaks", DL_C("c-neg", "<un><name>a</name><u>u1</u></un><mx>x</mx><mx>y</mx>"),
+        {"-/dl:c-neg/mx[.='x']"}, E_OK},
+
+    /* the shape of the edit */
+    {"reader and target go together", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r", "<lref>i1</lref>")),
+        {"-" DL_P "item[name='i1']", NULL, "-" DL_P "r[name='r']"}, E_OK},
+    {"target and an unrelated reader go", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r1", "<lref>i1</lref>")
+        DL_R("r2", "<lref>i2</lref>")), {"-" DL_P "item[name='i1']", NULL, "-" DL_P "r[name='r2']"}, E_BAD},
+    {"target goes and the reader is repointed", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r", "<lref>i1</lref>")),
+        {"-" DL_P "item[name='i1']", NULL, DL_P "r[name='r']/lref", "i2"}, E_OK},
+    {"target goes and the reader is repointed to a new one", DL_T(DL_I("i1", "a") DL_I("i2", "b")
+        DL_R("r", "<lref>i1</lref>")), {"-" DL_P "item[name='i1']", NULL, DL_P "item[name='i9']", NULL,
+        DL_P "r[name='r']/lref", "i9"}, E_OK},
+    {"one of two targets goes, the reader stays", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r", "<lrefs>i1</lrefs>")),
+        {"-" DL_P "item[name='i2']"}, E_OK},
+    {"two targets go, one is read", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_I("i3", "c") DL_R("r", "<lrefs>i1</lrefs>")),
+        {"-" DL_P "item[name='i2']", NULL, "-" DL_P "item[name='i1']"}, E_BAD},
+    {"a whole subtree goes, only a descendant is read", DL_T("<inner><a>a</a><x><name>x1</name></x><x><name>x2</name></x></inner>"
+        DL_R("r", "<m-anc2>y</m-anc2>")), {"-" DL_P "inner"}, E_BAD},
+    {"a leaf reader is deleted", DL_T(DL_I("i1", "a") DL_R("r", "<lref>i1</lref>")), {"-" DL_P "r[name='r']/lref"}, E_OK},
+};
+
+/*
+ * A rule that reads a container as a whole, while the edit deletes or changes a descendant of it. The edit touches
+ * only the node and what is below it, so the rule must have the descendants of the container among its atoms.
+ */
+static const struct dl_case dl_ancestor_cases[] = {
+    {"must counts the children of a container", DL_T("<inner><a>a</a><x><name>x1</name></x><x><name>x2</name></x></inner>"
+        DL_R("r", "<m-anc2>y</m-anc2>")), {"-" DL_P "inner/x[name='x1']"}, E_BAD},
+    {"must reads the string value of a container", DL_T("<inner><a>a</a><x><name>x1</name></x><x><name>x2</name></x></inner>"
+        DL_R("r", "<m-anc>y</m-anc>")), {"-" DL_P "inner/x[name='x1']"}, E_BAD},
+    {"rule of another module reads the string value of a container", DL_T("<inner><a>a</a><x><name>x1</name></x>"
+        "<x><name>x2</name></x></inner>") DM_M("<manc>y</manc>"), {"-" DL_P "inner/x[name='x1']"}, E_BAD},
+    {"a leaf below a container changes its string value", DL_T("<inner><a>a</a><x><name>x1</name></x></inner>"
+        DL_R("r", "<m-anc3>y</m-anc3>")), {DL_P "inner/a", "bad"}, E_BAD},
+    {"a leaf below a container changes the string value another module reads", DL_T("<inner><a>a</a>"
+        "<x><name>x1</name></x></inner>") DM_M("<manc2>y</manc2>"), {DL_P "inner/a", "bad"}, E_BAD},
+};
+
+/**
+ * @brief Run every case with the modules in both orders, so a reader that sits in the module validated first is
+ * covered as well as one validated last.
+ */
+static void
+dl_run(void **state, const struct dl_case *cases, uint32_t count)
+{
+    const char *order[2][3] = {{"dl", "dm", NULL}, {"dm", "dl", NULL}};
+    struct lyd_node *before, *after;
+    uint32_t i, o;
+    LY_ERR rc;
+
+    dl_setup(state);
+    for (o = 0; o < 2; ++o) {
+        check_mods[0] = order[o][0];
+        check_mods[1] = order[o][1];
+        for (i = 0; i < count; ++i) {
+            print_message("[  CASE    ] %s\n", cases[i].name);
+            before = parse_valid(state, cases[i].xml);
+            after = aug_apply(state, before, cases[i].edits);
+            check_same(state, before, after, 1, &rc);
+            if (rc != cases[i].expected) {
+                print_message("[  MSG     ] case \"%s\" (order %s,%s): expected %d, got %d\n", cases[i].name,
+                        order[o][0], order[o][1], cases[i].expected, rc);
+            }
+            assert_int_equal(cases[i].expected, rc);
+            lyd_free_siblings(after);
+            lyd_free_siblings(before);
+        }
+    }
+    dl_done();
+}
+
+static void
+test_del_cases(void **state)
+{
+    dl_run(state, dl_cases, sizeof dl_cases / sizeof *dl_cases);
+}
+
+static void
+test_del_ancestor_reader(void **state)
+{
+    dl_run(state, dl_ancestor_cases, sizeof dl_ancestor_cases / sizeof *dl_ancestor_cases);
+}
+
+/**
+ * @brief Paths of the nodes an edit can delete.
+ *
+ * Keys cannot go on their own and defaults are not stored, every other node counts: instances, containers and leaves.
+ *
+ * @param[in] inst_only Keep only list and leaf-list instances and containers.
+ */
+static char **
+dl_paths(const struct lyd_node *tree, ly_bool inst_only, uint32_t *count)
+{
+    const struct lyd_node *top, *elem;
+    char **paths = NULL;
+
+    *count = 0;
+    LY_LIST_FOR(tree, top) {
+        LYD_TREE_DFS_BEGIN(top, elem) {
+            if (!(elem->flags & LYD_DEFAULT) && !(elem->schema->flags & LYS_KEY) &&
+                    (!inst_only || (elem->schema->nodetype & (LYS_LIST | LYS_LEAFLIST | LYS_CONTAINER)))) {
+                paths = realloc(paths, (*count + 1) * sizeof *paths);
+                assert_non_null(paths);
+                paths[(*count)++] = lyd_path(elem, LYD_PATH_STD, NULL, 0);
+                assert_non_null(paths[*count - 1]);
+            }
+            LYD_TREE_DFS_END(top, elem);
+        }
+    }
+    return paths;
+}
+
+/**
+ * @brief Delete @p path unless an earlier delete already took it along.
+ *
+ * @return Whether it was there.
+ */
+static ly_bool
+dl_drop(struct lyd_node **tree, const char *path)
+{
+    struct ly_set *set = NULL;
+    ly_bool found;
+
+    assert_int_equal(LY_SUCCESS, lyd_find_xpath(*tree, path, &set));
+    found = (set->count == 1);
+    ly_set_free(set, NULL);
+    if (found) {
+        drop_node(tree, path);
+    }
+    return found;
+}
+
+/**
+ * @brief Delete nodes of a tree holding every reader, and let the full validation say what breaks.
+ *
+ * Nothing is predicted here, which is the point: a reader the hand-written cases missed still shows as a verdict
+ * or a tree that differs between the two validators. Every single node goes, then every pair of instances, then
+ * seeded random sets of up to four nodes.
+ */
+static void
+test_del_sweep(void **state)
+{
+    struct lyd_node *before, *after;
+    char **all, **inst;
+    uint32_t all_count, inst_count, i, j, k, n, seed, edits, rejected = 0, runs = 0;
+    LY_ERR rc;
+
+    dl_setup(state);
+    before = parse_valid(state, dl_xml);
+    all = dl_paths(before, 0, &all_count);
+    inst = dl_paths(before, 1, &inst_count);
+
+    /* every node alone */
+    for (i = 0; i < all_count; ++i) {
+        assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+        drop_node(&after, all[i]);
+        check_same(state, before, after, 1, &rc);
+        rejected += rc ? 1 : 0;
+        ++runs;
+        lyd_free_siblings(after);
+    }
+    print_message("[  MSG     ] sweep, single delete: %u nodes, %u rejected\n", runs, rejected);
+    assert_true(runs > 100);
+    assert_true(rejected > 20);
+    assert_true(runs - rejected > 20);
+
+    /* every pair of instances and containers */
+    rejected = 0;
+    runs = 0;
+    for (i = 0; i < inst_count; ++i) {
+        for (j = i + 1; j < inst_count; ++j) {
+            assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+            if (dl_drop(&after, inst[i]) && dl_drop(&after, inst[j])) {
+                check_same(state, before, after, 1, &rc);
+                rejected += rc ? 1 : 0;
+                ++runs;
+            }
+            lyd_free_siblings(after);
+        }
+    }
+    print_message("[  MSG     ] sweep, pairs: %u edits, %u rejected\n", runs, rejected);
+    assert_true(runs > 500);
+    assert_true(rejected > 100);
+
+    /* random sets, anything may go together */
+    rejected = 0;
+    runs = 0;
+    for (seed = 1; seed <= DL_SWEEP_SEEDS; ++seed) {
+        srand(seed);
+        assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+        edits = 0;
+        n = 2 + rand() % 3;
+        for (k = 0; k < n; ++k) {
+            edits += dl_drop(&after, all[rand() % all_count]);
+        }
+        if (edits) {
+            check_same(state, before, after, 1, &rc);
+            rejected += rc ? 1 : 0;
+            ++runs;
+        }
+        lyd_free_siblings(after);
+    }
+    print_message("[  MSG     ] sweep, random sets: %u edits, %u rejected\n", runs, rejected);
+    assert_true(runs > DL_SWEEP_SEEDS / 2);
+
+    for (i = 0; i < all_count; ++i) {
+        free(all[i]);
+    }
+    for (i = 0; i < inst_count; ++i) {
+        free(inst[i]);
+    }
+    free(all);
+    free(inst);
+    lyd_free_siblings(before);
+    dl_done();
+}
+
+/**
+ * @brief A rule that reads data, and whether some single delete is known to break it.
+ */
+struct dl_reader {
+    const char *name;
+    const char *keep[3];    /**< what must stay for the rule to be there at all */
+    ly_bool single;         /**< some single delete breaks it */
+};
+
+#define DL_RD(n, single) {n, {"/dl:top/r[name='" n "']"}, single}
+
+static const struct dl_reader dl_readers[] = {
+    DL_RD("r-lref", 1), DL_RD("r-tref", 1), DL_RD("r-uref", 1), DL_RD("r-lrefs", 1), DL_RD("r-dref", 1),
+    DL_RD("r-mexist", 1), DL_RD("r-mval", 1), DL_RD("r-mcount", 1), DL_RD("r-msum", 1), DL_RD("r-mfirst", 1),
+    DL_RD("r-mou1", 1), DL_RD("r-moul", 1), DL_RD("r-mdd", 1), DL_RD("r-manc", 1), DL_RD("r-manc2", 1),
+    /* only emptying the container breaks it, which takes both lists, and a when only drops its node */
+    DL_RD("r-mnp", 0), DL_RD("r-won", 0),
+    {"kr", {"/dl:top/kr[k='i3']"}, 1},
+    {"wr", {"/dl:top/wr[name='w1']", "/dl:top/r[name='r-won']"}, 1},
+    {"wcr", {"/dl:top/wcr"}, 1},
+    {"st", {"/dl:st"}, 1},
+    {"m1", {"/dm:mtop/mr[name='m1']"}, 1},
+    {"m2", {"/dm:mtop/mr[name='m2']"}, 1},
+    {"m3", {"/dm:mtop/mr[name='m3']"}, 1},
+    {"aug-ref", {"/dl:top/item[name='i4']/dm:aug-ref"}, 1},
+};
+
+/** @brief every rule the tree holds, so a variant can drop all but one */
+static const char *const dl_reader_paths[] = {
+    "/dl:top/r[name='r-lref']", "/dl:top/r[name='r-tref']", "/dl:top/r[name='r-uref']", "/dl:top/r[name='r-lrefs']",
+    "/dl:top/r[name='r-dref']", "/dl:top/r[name='r-mexist']", "/dl:top/r[name='r-mval']", "/dl:top/r[name='r-mcount']",
+    "/dl:top/r[name='r-msum']", "/dl:top/r[name='r-mfirst']", "/dl:top/r[name='r-mou1']", "/dl:top/r[name='r-moul']",
+    "/dl:top/r[name='r-mdd']", "/dl:top/r[name='r-mnp']", "/dl:top/r[name='r-manc']", "/dl:top/r[name='r-manc2']",
+    "/dl:top/r[name='r-won']", "/dl:top/kr[k='i3']", "/dl:top/wr[name='w1']", "/dl:top/wcr", "/dl:st",
+    "/dm:mtop/mr[name='m1']", "/dm:mtop/mr[name='m2']", "/dm:mtop/mr[name='m3']",
+    "/dl:top/item[name='i4']/dm:aug-ref",
+};
+
+/**
+ * @brief Delete every node of a tree in which exactly one rule reads the data.
+ *
+ * The sweep of everything at once can hide a missed rule behind another one that rejects the same edit, because the
+ * two validators then agree on the verdict. With one rule left, nothing else can reject, so a delete that rule
+ * should have caught is the only thing that differs.
+ */
+static void
+test_del_sweep_by_reader(void **state)
+{
+    struct lyd_node *base, *variant, *after;
+    char **all;
+    uint32_t r, i, j, k, count, rejected;
+    ly_bool keep;
+    LY_ERR rc;
+
+    dl_setup(state);
+    base = parse_valid(state, dl_xml);
+
+    for (r = 0; r < sizeof dl_readers / sizeof *dl_readers; ++r) {
+        assert_int_equal(LY_SUCCESS, lyd_dup_siblings(base, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &variant));
+        for (i = 0; i < sizeof dl_reader_paths / sizeof *dl_reader_paths; ++i) {
+            keep = 0;
+            for (k = 0; dl_readers[r].keep[k]; ++k) {
+                keep |= !strcmp(dl_readers[r].keep[k], dl_reader_paths[i]);
+            }
+            if (!keep) {
+                dl_drop(&variant, dl_reader_paths[i]);
+            }
+        }
+        settle(state, &variant);
+
+        all = dl_paths(variant, 0, &count);
+        rejected = 0;
+        for (j = 0; j < count; ++j) {
+            assert_int_equal(LY_SUCCESS, lyd_dup_siblings(variant, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+            drop_node(&after, all[j]);
+            check_same(state, variant, after, 1, &rc);
+            rejected += rc ? 1 : 0;
+            lyd_free_siblings(after);
+            free(all[j]);
+        }
+        print_message("[  MSG     ] only %s: %u nodes, %u rejected\n", dl_readers[r].name, count, rejected);
+        if (dl_readers[r].single) {
+            assert_true(rejected > 0);
+        }
+        free(all);
+        lyd_free_siblings(variant);
+    }
+
+    lyd_free_siblings(base);
+    dl_done();
+}
+
 int
 main(void)
 {
@@ -1930,6 +3020,9 @@ main(void)
         UTEST(test_stale_default),
         UTEST(test_dflt_when_remote),
         UTEST(test_stats),
+        UTEST(test_shallow_delete),
+        UTEST(test_shallow_gate),
+        UTEST(test_shallow_levels),
         UTEST(test_schema_change),
         UTEST(test_aug_add),
         UTEST(test_aug_delete),
@@ -1946,6 +3039,11 @@ main(void)
         UTEST(test_aug_module_order),
         UTEST(test_aug_instance_identifier),
         UTEST(test_aug_random_edits),
+        UTEST(test_del_cases),
+        UTEST(test_del_sweep),
+        UTEST(test_del_sweep_by_reader),
+        UTEST(test_del_childless_diff),
+        UTEST(test_del_ancestor_reader),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

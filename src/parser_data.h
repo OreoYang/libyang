@@ -220,6 +220,11 @@ struct ly_in;
 #define LYD_VALIDATE_NOT_FINAL 0x0020       /**< Skip final validation tasks that require for all the data nodes to
                                                  either exist or not, based on the YANG constraints. Once the data
                                                  satisfy this requirement, the final validation should be performed. */
+#define LYD_VALIDATE_INCR_SHALLOW_DELETE 0x8000 /**< Only for ::lyd_validate_module_incr() and
+                                                 ::lyd_validate_module_incr_final(), ignored elsewhere. A deleted
+                                                 list or leaf-list instance with no list instance above it revalidates
+                                                 the checks of its parent instead of the whole top-level subtree, see
+                                                 ::lyd_validate_module_incr(). Pass it to both calls or to neither. */
 
 #define LYD_VALIDATE_OPTS_MASK  0x0000FFFF  /**< Mask for all the LYD_VALIDATE_* options. */
 
@@ -540,6 +545,12 @@ LIBYANG_API_DECL LY_ERR lyd_validate_module_final(struct lyd_node *tree, const s
  * validation, or validated against another schema) is not reported. Use ::lyd_validate_module() whenever the
  * tree before the edit cannot be trusted to be valid.
  *
+ * A deleted list instance leaves no node to start from, so it normally revalidates the whole top-level subtree
+ * around it when no list instance is above it. With ::LYD_VALIDATE_INCR_SHALLOW_DELETE the parent is checked
+ * instead (its own constraints, the number of instances, defaults that may appear): any rule in a sibling instance
+ * that reads the deleted one is cross-instance and rechecked on its own. A rule outside every list that reads
+ * the deleted data keeps the wide scope.
+ *
  * Pass @p edit_diff as NULL to validate in full. As with ::lyd_validate_module(), use ::LYD_VALIDATE_NOT_FINAL
  * and follow up with ::lyd_validate_module_incr_final() when validating several modules. In that case merge
  * the @p diff of every module into the edit diff before validating the next module and before the final calls.
@@ -601,6 +612,15 @@ LIBYANG_API_DECL void lyd_validate_incr_late_stats(const struct ly_ctx *ctx, uin
  * @param[out] skips Conditions left unevaluated because the edit could not have violated them.
  */
 LIBYANG_API_DECL void lyd_validate_incr_must_stats(const struct ly_ctx *ctx, uint64_t *evals, uint64_t *skips);
+
+/**
+ * @brief Read how many deleted instances got the narrow scope of ::LYD_VALIDATE_INCR_SHALLOW_DELETE.
+ *
+ * @param[in] ctx Context to read, NULL for the totals of the process.
+ * @param[out] shallow_deletes Parents checked instead of revalidating the whole top-level subtree, one per
+ * incremental call and parent.
+ */
+LIBYANG_API_DECL void lyd_validate_incr_shallow_stats(const struct ly_ctx *ctx, uint64_t *shallow_deletes);
 
 /**
  * @brief Validate an RPC/action request, reply, or notification. Only the operation data tree (input/output/notif)

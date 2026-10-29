@@ -657,26 +657,64 @@ unbounded:
 }
 
 /**
+ * @brief Whether another atom of @p set sits below @p atom.
+ */
+static ly_bool
+lyd_val_dep_atom_has_below(const struct ly_set *set, const struct lysc_node *atom)
+{
+    const struct lysc_node *iter;
+    uint32_t i;
+
+    for (i = 0; i < set->count; ++i) {
+        for (iter = set->snodes[i] ? lysc_data_parent(set->snodes[i]) : NULL; iter; iter = lysc_data_parent(iter)) {
+            if (iter == atom) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief Turn an atom set into a NULL-terminated array owned by the index.
+ *
+ * A container or list that no other atom of the expression sits below is read as a whole, its string value or a
+ * comparison with it, so whatever changes below it can change the result. Its descendants are atoms too; an edit
+ * touches the edited node and its descendants, never its ancestors.
  */
 static LY_ERR
 lyd_val_dep_atoms_store(struct ly_set *set, const struct lysc_node ***atoms_p)
 {
-    const struct lysc_node **atoms;
-    uint32_t i, count = 0;
+    struct ly_set all = {0};
+    const struct lysc_node **atoms = NULL, *atom, *elem;
+    uint32_t i;
+    LY_ERR rc = LY_SUCCESS;
 
-    atoms = calloc(set ? set->count + 1 : 1, sizeof *atoms);
-    if (!atoms) {
-        return LY_EMEM;
-    }
     for (i = 0; set && (i < set->count); ++i) {
-        if (set->snodes[i]) {
-            atoms[count++] = set->snodes[i];
+        atom = set->snodes[i];
+        if (!atom) {
+            continue;
+        }
+        LY_CHECK_GOTO(rc = ly_set_add(&all, (void *)atom, 0, NULL), cleanup);
+        if ((atom->nodetype & LYD_NODE_TERM) || lyd_val_dep_atom_has_below(set, atom)) {
+            continue;
+        }
+        LYSC_TREE_DFS_BEGIN(atom, elem) {
+            LY_CHECK_GOTO(rc = ly_set_add(&all, (void *)elem, 0, NULL), cleanup);
+            LYSC_TREE_DFS_END(atom, elem);
         }
     }
-    atoms[count] = NULL;
+
+    atoms = calloc(all.count + 1, sizeof *atoms);
+    LY_CHECK_ERR_GOTO(!atoms, rc = LY_EMEM, cleanup);
+    for (i = 0; i < all.count; ++i) {
+        atoms[i] = all.snodes[i];
+    }
     *atoms_p = atoms;
-    return LY_SUCCESS;
+
+cleanup:
+    ly_set_erase(&all, NULL);
+    return rc;
 }
 
 static LY_ERR
