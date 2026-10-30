@@ -152,6 +152,7 @@ struct lyd_val_dep_shape {
     ly_bool current;        /**< calls current() */
     ly_bool deref;          /**< calls deref() */
     ly_bool antitone;       /**< contains negation or node counting, so appearing nodes can violate it */
+    uint32_t antitone_ups;  /**< most parent steps taken inside a negation or counting that has no absolute path */
     ly_bool predicates;     /**< contains at least one predicate */
 };
 
@@ -172,6 +173,56 @@ lyd_val_dep_span_has_abs(const struct lyxp_expr *expr, uint32_t from, uint32_t t
 }
 
 /**
+ * @brief Most parent steps ('..') a relative path takes within a token range.
+ *
+ * Only an upper bound: down steps are not subtracted and a sibling or ancestor axis counts as unbounded.
+ */
+static uint32_t
+lyd_val_dep_span_ups(const struct lyxp_expr *expr, uint32_t from, uint32_t to)
+{
+    uint32_t i, run = 0, max = 0, level = 0, base[16] = {0};
+
+    for (i = from; (i < to) && (i < expr->used); ++i) {
+        switch (expr->tokens[i]) {
+        case LYXP_TOKEN_DDOT:
+            if (++run > max) {
+                max = run;
+            }
+            break;
+        case LYXP_TOKEN_AXISNAME:
+            if (!lyd_val_dep_tok_is(expr, i, "self") && !lyd_val_dep_tok_is(expr, i, "child")) {
+                return UINT32_MAX;
+            }
+            break;
+        case LYXP_TOKEN_BRACK1:
+            /* paths in a predicate start at the filtered node, at most run steps above the context node */
+            if (level == (sizeof base / sizeof *base) - 1) {
+                return UINT32_MAX;
+            }
+            base[++level] = run;
+            break;
+        case LYXP_TOKEN_BRACK2:
+            /* the path goes on from the filtered node */
+            if (level) {
+                run = base[level--];
+            }
+            break;
+        case LYXP_TOKEN_DOT:
+        case LYXP_TOKEN_NAMETEST:
+        case LYXP_TOKEN_OPER_PATH:
+        case LYXP_TOKEN_PAR1:
+        case LYXP_TOKEN_PAR2:
+            break;
+        default:
+            /* a new operand, including current(), starts counting again from the node the operands start at */
+            run = base[level];
+            break;
+        }
+    }
+    return max;
+}
+
+/**
  * @brief Index just past the argument list of a function call starting at @p tok.
  */
 static uint32_t
@@ -189,6 +240,17 @@ lyd_val_dep_call_end(const struct lyxp_expr *expr, uint32_t tok)
         }
     }
     return expr->used;
+}
+
+/**
+ * @brief Remember the highest parent-step count seen inside a negation or counting.
+ */
+static void
+lyd_val_dep_note_ups(struct lyd_val_dep_shape *shape, uint32_t ups)
+{
+    if (ups > shape->antitone_ups) {
+        shape->antitone_ups = ups;
+    }
 }
 
 /**
@@ -299,11 +361,14 @@ lyd_val_dep_shape_scan(const struct lyxp_expr *expr, struct lyd_val_dep_shape *s
                 shape->blocked = 1;
                 return;
             }
-            if (lyd_val_dep_tok_in(expr, i, lyd_val_dep_antitone_funcs) &&
-                    lyd_val_dep_span_has_abs(expr, i, lyd_val_dep_call_end(expr, i))) {
-                /* negating or counting something reachable only from the data root; nodes appearing
-                 * elsewhere in the tree can flip the result */
-                shape->antitone = 1;
+            if (lyd_val_dep_tok_in(expr, i, lyd_val_dep_antitone_funcs)) {
+                if (lyd_val_dep_span_has_abs(expr, i, lyd_val_dep_call_end(expr, i))) {
+                    /* negating or counting something reachable only from the data root; nodes appearing
+                     * elsewhere in the tree can flip the result */
+                    shape->antitone = 1;
+                } else {
+                    lyd_val_dep_note_ups(shape, lyd_val_dep_span_ups(expr, i, lyd_val_dep_call_end(expr, i)));
+                }
             }
             break;
         case LYXP_TOKEN_OPER_MATH: {
@@ -313,6 +378,8 @@ lyd_val_dep_shape_scan(const struct lyxp_expr *expr, struct lyd_val_dep_shape *s
             lyd_val_dep_operand_span(expr, i, &from, &to);
             if (lyd_val_dep_span_has_abs(expr, from, to)) {
                 shape->antitone = 1;
+            } else {
+                lyd_val_dep_note_ups(shape, lyd_val_dep_span_ups(expr, from, to));
             }
             break;
         }
@@ -322,6 +389,8 @@ lyd_val_dep_shape_scan(const struct lyxp_expr *expr, struct lyd_val_dep_shape *s
             lyd_val_dep_operand_span(expr, i, &from, &to);
             if (lyd_val_dep_span_has_abs(expr, from, to)) {
                 shape->antitone = 1;
+            } else {
+                lyd_val_dep_note_ups(shape, lyd_val_dep_span_ups(expr, from, to));
             }
             break;
         }
@@ -549,6 +618,28 @@ lyd_val_dep_value_keyed_shape(const struct lyxp_expr *expr, const struct lysc_no
     return self;
 }
 
+/**
+ * @brief Number of parent steps from a node up to the outermost list instance containing it, or up to its
+ * top-level node when no list contains it.
+ */
+static uint32_t
+lyd_val_dep_instance_depth(const struct lysc_node *node)
+{
+    const struct lysc_node *parent;
+    uint32_t steps = 0, list_steps = 0;
+    ly_bool in_list = (node->nodetype == LYS_LIST) ? 1 : 0;
+
+    while ((parent = lysc_data_parent(node))) {
+        ++steps;
+        if (parent->nodetype == LYS_LIST) {
+            in_list = 1;
+            list_steps = steps;
+        }
+        node = parent;
+    }
+    return in_list ? list_steps : steps;
+}
+
 enum lyd_val_dep_class
 lyd_val_dep_classify_expr(const struct lysc_node *ctx_node, const struct lys_module *cur_mod,
         const struct lyxp_expr *expr, const struct lysc_prefix *prefixes, struct ly_set **atoms,
@@ -646,6 +737,12 @@ cross_instance:
     }
     if (!shape.current && !shape.deref) {
         goto unbounded;
+    }
+    if (!shape.antitone && shape.antitone_ups &&
+            (!ctx_node || (shape.antitone_ups > lyd_val_dep_instance_depth(ctx_node)))) {
+        /* a negation or counting that climbs out of the outermost list instance holding the rule reads
+         * sibling instances, nodes appearing there are not in the scope root of an edit that reaches the rule */
+        shape.antitone = 1;
     }
     if (creation_safe && !shape.antitone && shape.predicates && lyd_val_dep_preds_are_keys(expr, set)) {
         *creation_safe = 1;

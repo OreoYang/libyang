@@ -2254,7 +2254,38 @@ static const char *schema_dl =
         "        }\n"
         "        container inner {\n"
         "            leaf a { type string; }\n"
-        "            list x { key name; leaf name { type string; } }\n"
+        "            list x { key name; leaf name { type string; } leaf chk { type string; must \"count(../../x) >= 2\"; } }\n"
+        "        }\n"
+        "        leaf-list dtag { type string; default \"d1\"; }\n"
+        "        list pos { key name; leaf name { type string; }\n"
+        "            leaf pp { type string; must \"count(../preceding-sibling::pos) >= 1\"; } }\n"
+        "        list grp {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            list mem { key name; leaf name { type string; } }\n"
+        "            leaf need { type string; must \"count(../mem) >= 2\"; }\n"
+        "            leaf xr { type string; must \"count(../../grp/mem) >= 3\"; }\n"
+        "            leaf want { type string; }\n"
+        "            leaf other { type string; }\n"
+        "            leaf lv { type string; }\n"
+        "            leaf nx { type string; must \"not(../../grp[name = current()/../other]/mem[name = current()/../want])\"; }\n"
+        "            leaf nc { type string; must \"count(../../grp[name = current()/../other]/mem[name = current()/../want]) = 0\"; }\n"
+        "            leaf nf { type string; must \"contains(../../grp[name = 'g2']/lv, 'ok')\"; }\n"
+        "            leaf mv { type string; must \"../../grp[name = 'g2']/lv = 'ok'\"; }\n"
+        "            leaf wn { type string; when \"not(../../grp[name = current()/../other]/mem[name = current()/../want])\"; }\n"
+        /* climbs on after a predicate that compares, out of the grp instance */
+        "            container pc { leaf np { type string; must \"count(../../mem[name = 'x']/../../grp[name = "
+        "current()/../../other]/mem[name = current()/../../want]) = 0\"; } }\n"
+        "        }\n"
+        "        list tpl {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            list comp { key name; leaf name { type string; } leaf cls { type string; } }\n"
+        "            list ifc {\n"
+        "                key name;\n"
+        "                leaf name { type string; }\n"
+        "                leaf hw { type string; must \"../../comp[name = current()]/cls = 'ok'\"; }\n"
+        "            }\n"
         "        }\n"
         "        list kr {\n"
         "            key k;\n"
@@ -2298,16 +2329,25 @@ static const char *schema_dl =
         "            leaf m-oul { type string; must \"../../ou[last()]/name = 'tail'\"; }\n"
         "            leaf m-dd { type string; must \"../../item[name = 'i1']/dd = 'z'\"; }\n"
         "            leaf m-np { type string; must \"/dl:c-np/dl:l\"; }\n"
+        "            leaf m-desc { type string; must \"count(../../inner//dl:name) >= 2\"; }\n"
+        "            leaf lrf { type leafref { path \"../../item/name\"; require-instance false; } }\n"
+        "            leaf m-der { type string; must \"deref(../lrf)/../val = 'good'\"; }\n"
+        "            leaf m-dflt { type string; must \"../../dtag = 'x'\"; }\n"
+        "            leaf m-fs { type string; must \"count(../following-sibling::r) >= 1\"; }\n"
+        "            leaf m-ttag { type string; must \"count(../../tag[. = 't1']) = 1\"; }\n"
+        "            leaf m-alln { type string; must \"count(/dl:top/*) >= 7\"; }\n"
         /* these two read a container, which is an ancestor of what the edit deletes */
         "            leaf m-anc { type string; must \"contains(string(../../inner), 'x1')\"; }\n"
         "            leaf m-anc2 { type string; must \"count(../../inner/*) >= 3\"; }\n"
         "            leaf m-anc3 { type string; must \"not(contains(string(../../inner), 'bad'))\"; }\n"
+        "            leaf m-cap { type string; must \"count(/dl:top/dl:item) <= 3\"; }\n"
+        "            leaf sw { type string; }\n"
+        "            leaf dep { type string; when \"../sw = 'on'\"; }\n"
+        "            leaf m-dep { type string; must \"../dep\"; }\n"
         "            leaf w-on { type string; when \"../../item[name = 'gate']\"; }\n"
-        /* defaults that exist only while their when holds: one reads the deleted instance, the other reads w-on,
-         * which the validation itself drops once the gate is gone */
-        "            leaf dgate { type string; default \"d\"; when \"../../item[name = 'gate']\"; }\n"
+        /* a default that exists only while its when holds, which reads w-on, which the validation itself drops once
+         * the gate is gone */
         "            leaf dw { type string; default \"d\"; when \"../w-on\"; }\n"
-        "            leaf dopen { type string; default \"d\"; when \"not(../../item[name = 'gate'])\"; }\n"
         "        }\n"
         "    }\n"
         "\n"
@@ -2351,6 +2391,88 @@ static const char *schema_dl =
         "        config false;\n"
         "        list s { key name; leaf name { type string; } leaf sref { type leafref { path \"/dl:top/dl:item/dl:name\"; } } }\n"
         "    }\n"
+        "identity cap-base;\n"
+        "identity cap-download { base cap-base; }\n"
+        "identity cap-sub { base cap-download; }\n"
+        "identity cap-other { base cap-base; }\n"
+        "identity fmt-base;\n"
+        "identity fmt-ssh { base fmt-base; }\n"
+        "identity fmt-other { base fmt-base; }\n"
+        "\n"
+        "container pr {\n"
+        "    list shaper { key name; leaf name { type string; } leaf single { type string; } leaf two { type string; } }\n"
+        "    list qprof {\n"
+        "        key name;\n"
+        "        leaf name { type string; }\n"
+        "        container queues {\n"
+        "            list queue {\n"
+        "                key name;\n"
+        "                leaf name { type string; }\n"
+        "                leaf dual { type string; }\n"
+        "                leaf shaper-name {\n"
+        "                    type leafref { path \"/dl:pr/dl:shaper/dl:name\"; }\n"
+        "                    must \"(not(boolean(current()/../dual)) and boolean(/dl:pr/dl:shaper[dl:name=current()]/dl:single)) or (boolean(current()/../dual) and boolean(/dl:pr/dl:shaper[dl:name=current()]/dl:two))\";\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "    list bq {\n"
+        "        key name;\n"
+        "        leaf name { type string; }\n"
+        "        leaf sref { type leafref { path \"/dl:pr/dl:shaper/dl:name\"; } }\n"
+        "        leaf burst { type string; when \"boolean(/dl:pr/dl:shaper[dl:name=current()/../sref]/dl:single)\"; }\n"
+        "    }\n"
+        "    list tmpl { key name; leaf name { type string; } list ifc { key name; leaf name { type string; } leaf v4 { type string; } leaf v6 { type string; } } }\n"
+        "    list onu {\n"
+        "        key name;\n"
+        "        leaf name { type string; }\n"
+        "        leaf tref { type string; }\n"
+        "        list term {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf peer { type leafref { path \"../../term/name\"; } }\n"
+        "            leaf ipif {\n"
+        "                type string;\n"
+        "                must \"boolean(/dl:pr/dl:tmpl[dl:name=current()/ancestor::dl:onu/dl:tref]/dl:ifc[dl:name=current()]/dl:v4) or boolean(/dl:pr/dl:tmpl[dl:name=current()/ancestor::dl:onu/dl:tref]/dl:ifc[dl:name=current()]/dl:v6)\";\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "    list comp {\n"
+        "        key name;\n"
+        "        leaf name { type string; }\n"
+        "        container revs {\n"
+        "            leaf cap { type string; }\n"
+        "            leaf dcap { type identityref { base cap-base; } }\n"
+        "            list rev {\n"
+        "                key name;\n"
+        "                leaf name { type string; }\n"
+        "                leaf state { type string; }\n"
+        "                leaf alias { type string; when \"boolean(../../cap='alias')\"; }\n"
+        "                leaf act { type string; when \"boolean(../../cap='act') and (../state='available' or ../state='in-use')\"; }\n"
+        "                leaf fin { type string; when \"derived-from(../../dcap, 'dl:cap-download') and ../state != 'downloading'\"; }\n"
+        "            }\n"
+        "            leaf download { type string; when \"derived-from(../dcap, 'dl:cap-download') and count(../rev[state='downloading'])=0\"; }\n"
+        "        }\n"
+        "    }\n"
+        "    list tp {\n"
+        "        key name;\n"
+        "        leaf name { type string; }\n"
+        "        container tcs {\n"
+        "            must \"not(boolean(tc)) or tc[not(../tc/position > position)]/position <= count(current()/tc)\";\n"
+        "            list tc { key position; leaf position { type uint32; } leaf duration { type string; } }\n"
+        "            leaf rb { type string; when \"(count(../tc) > 1) and ../tc[position=count(../tc)]/duration != 'continuous'\"; }\n"
+        "        }\n"
+        "    }\n"
+        "    list tsb { key name; leaf name { type string; } list pk { key name; leaf name { type string; } leaf fmt { type identityref { base fmt-base; } } } }\n"
+        "    list usr {\n"
+        "        key name;\n"
+        "        leaf name { type string; }\n"
+        "        leaf ref {\n"
+        "            type leafref { path \"/dl:pr/dl:tsb/dl:name\"; }\n"
+        "            must \"not(deref(.)/../dl:pk/dl:fmt[not(derived-from-or-self(., 'dl:fmt-ssh'))])\";\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
         "}";
 
 static const char *schema_dm =
@@ -2376,6 +2498,31 @@ static const char *schema_dm =
         "        leaf aug-ref { type leafref { path \"/dl:top/dl:tag\"; } }\n"
         "    }\n"
         "}";
+
+/*
+ * Defaults that exist only while a rule that reads another instance holds. A module with such a node has to be
+ * validated in full whenever an edit touches what the rule reads, so they live in a module of their own: next to
+ * the readers of dl they would turn every edit of the item list into a full validation, and the cases would no
+ * longer test the incremental path.
+ */
+static const char *schema_dz =
+        "module dz {\n"
+        "    namespace urn:tests:dz;\n"
+        "    prefix dz;\n"
+        "    yang-version 1.1;\n"
+        "    import dl { prefix dl; }\n"
+        "\n"
+        "    container zt {\n"
+        "        list zr {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf dgate { type string; default \"d\"; when \"/dl:top/dl:item[dl:name = 'gate']\"; }\n"
+        "            leaf dopen { type string; default \"d\"; when \"not(/dl:top/dl:item[dl:name = 'gate'])\"; }\n"
+        "        }\n"
+        "    }\n"
+        "}";
+
+#define DZ_Z "<zt xmlns=\"urn:tests:dz\"><zr><name>z</name></zr></zt>"
 
 #define DL_T(x) "<top xmlns=\"urn:tests:dl\">" x "</top>"
 #define DL_C(c, x) "<" c " xmlns=\"urn:tests:dl\">" x "</" c ">"
@@ -2423,7 +2570,7 @@ static const char *dl_xml =
         DL_C("c-vk", "<vk><name>v1</name><grp>g1</grp></vk><vk><name>v2</name><grp>g1</grp></vk>"
         "<vk><name>v3</name><grp>g2</grp></vk><vk><name>v4</name><grp>g2</grp></vk>")
         DL_C("c-neg", "<un><name>a</name><u>u1</u></un><un><name>b</name><u>u2</u></un><mx>x</mx><mx>y</mx>")
-        DL_LONE
+        DL_LONE DZ_Z
         DL_C("st", "<s><name>n1</name><sref>i2</sref></s>")
         "<mtop xmlns=\"urn:tests:dm\"><mr><name>m1</name><iref>i1</iref></mr>"
         "<mr><name>m2</name><lone-ref>l1</lone-ref></mr><mr><name>m3</name><mcnt>y</mcnt></mr></mtop>";
@@ -2433,9 +2580,11 @@ dl_setup(void **state)
 {
     UTEST_ADD_MODULE(schema_dl, LYS_IN_YANG, NULL, NULL);
     UTEST_ADD_MODULE(schema_dm, LYS_IN_YANG, NULL, NULL);
+    UTEST_ADD_MODULE(schema_dz, LYS_IN_YANG, NULL, NULL);
     check_mods[0] = "dl";
     check_mods[1] = "dm";
-    check_mods[2] = NULL;
+    check_mods[2] = "dz";
+    check_mods[3] = NULL;
 }
 
 static void
@@ -2621,11 +2770,11 @@ static const struct dl_case dl_cases[] = {
     {"when turns true to false", DL_T(DL_GATE DL_R("r", "<w-on>v1</w-on>")), {"-" DL_P "item[name='gate']"}, E_OK},
     {"when turns false, a leafref reads the dropped node", DL_T(DL_GATE DL_R("r", "<w-on>v1</w-on>")
         "<wr><name>w1</name><wref>v1</wref></wr>"), {"-" DL_P "item[name='gate']"}, E_BAD},
-    {"when turns false to true, a default appears", DL_T(DL_GATE DL_R("r", "<sel>x</sel>")),
+    {"when turns false to true, a default appears", DL_T(DL_GATE DL_R("r", "<sel>x</sel>")) DZ_Z,
         {"-" DL_P "item[name='gate']"}, E_OK},
-    {"default node whose when reads the deleted instance", DL_T(DL_GATE DL_R("r", "<sel>x</sel>")),
+    {"default node whose when reads the deleted instance", DL_T(DL_GATE DL_R("r", "<sel>x</sel>")) DZ_Z,
         {"-" DL_P "item[name='gate']"}, E_OK},
-    {"default node whose when reads a node the validation drops", DL_T(DL_GATE DL_R("r", "<w-on>v1</w-on>")),
+    {"default node whose when reads a node the validation drops", DL_T(DL_GATE DL_R("r", "<w-on>v1</w-on>")) DZ_Z,
         {"-" DL_P "item[name='gate']"}, E_OK},
     {"when of a case turns false", DL_T(DL_GATE "<wc-v>cv</wc-v>") DL_LONE, {"-" DL_P "item[name='gate']"}, E_OK},
     {"when of a case turns false, a leafref reads it", DL_T(DL_GATE "<wc-v>cv</wc-v><wcr>cv</wcr>"),
@@ -2737,7 +2886,7 @@ static const struct dl_case dl_ancestor_cases[] = {
 static void
 dl_run(void **state, const struct dl_case *cases, uint32_t count)
 {
-    const char *order[2][3] = {{"dl", "dm", NULL}, {"dm", "dl", NULL}};
+    const char *order[2][4] = {{"dl", "dm", "dz", NULL}, {"dz", "dm", "dl", NULL}};
     struct lyd_node *before, *after;
     uint32_t i, o;
     LY_ERR rc;
@@ -2746,6 +2895,7 @@ dl_run(void **state, const struct dl_case *cases, uint32_t count)
     for (o = 0; o < 2; ++o) {
         check_mods[0] = order[o][0];
         check_mods[1] = order[o][1];
+        check_mods[2] = order[o][2];
         for (i = 0; i < count; ++i) {
             print_message("[  CASE    ] %s\n", cases[i].name);
             before = parse_valid(state, cases[i].xml);
@@ -2767,6 +2917,357 @@ static void
 test_del_cases(void **state)
 {
     dl_run(state, dl_cases, sizeof dl_cases / sizeof *dl_cases);
+}
+
+/** @brief constructs of the YANG language that no earlier case reads, each one a delete that full validation rejects */
+static const struct dl_case dl_probe_cases[] = {
+    {"descendant axis counts the nodes below a container", DL_T("<inner><x><name>x1</name></x><x><name>x2</name></x></inner>"
+        DL_R("r", "<m-desc>y</m-desc>")), {"-" DL_P "inner/x[name='x1']"}, E_BAD},
+    {"deref of a leafref without require-instance", DL_T(DL_I("i2", "good") DL_R("r", "<lrf>i2</lrf><m-der>y</m-der>")),
+        {"-" DL_P "item[name='i2']"}, LY_EINVAL},
+    {"a default leaf-list value appears when the explicit one goes", DL_T("<dtag>x</dtag>" DL_R("r", "<m-dflt>y</m-dflt>")),
+        {"-" DL_P "dtag[.='x']"}, E_BAD},
+    {"later sibling of the same list is read", DL_T(DL_R("r1", "<m-fs>y</m-fs>") DL_R("r2", "")),
+        {"-" DL_P "r[name='r2']"}, E_BAD},
+    {"earlier sibling is read by the preceding axis", DL_T("<pos><name>a</name></pos><pos><name>b</name><pp>y</pp></pos>"),
+        {"-" DL_P "pos[name='a']"}, E_BAD},
+    {"reader in the same list instance, member of a nested list", DL_T("<grp><name>g1</name><mem><name>a</name></mem>"
+        "<mem><name>b</name></mem><need>y</need></grp>"), {"-" DL_P "grp[name='g1']/mem[name='a']"}, E_BAD},
+    {"reader in another instance, member of a nested list", DL_T("<grp><name>g1</name><mem><name>a</name></mem>"
+        "<mem><name>b</name></mem></grp><grp><name>g2</name><mem><name>c</name></mem><xr>y</xr></grp>"),
+        {"-" DL_P "grp[name='g1']/mem[name='a']"}, E_BAD},
+    {"reader inside a sibling list instance reads the list", DL_T("<inner><x><name>x1</name></x><x><name>x2</name>"
+        "<chk>y</chk></x></inner>"), {"-" DL_P "inner/x[name='x1']"}, E_BAD},
+    {"count of one leaf-list value", DL_T("<tag>t1</tag><tag>t2</tag>" DL_R("r", "<m-ttag>y</m-ttag>")),
+        {"-" DL_P "tag[.='t1']"}, E_BAD},
+    {"count of every child of the container", DL_T("<tag>t1</tag><tag>t2</tag><num>1</num><num>2</num><inner/>"
+        DL_R("r", "<m-alln>y</m-alln>")), {"-" DL_P "tag[.='t1']"}, E_BAD},
+};
+
+/*
+ * What an add can break, one case per class of rule and per way to break it. The expectation is what full validation
+ * says; the case passes only if the incremental validation says the same. The page "Incremental YANG Validation:
+ * Add and Modify" lists these cases by name.
+ */
+#define DL_G1 "<grp><name>g1</name><want>w1</want><other>g2</other>"
+static const struct dl_case dl_add_cases[] = {
+    /* LOCAL */
+    {"add: LOCAL leafref without target", DL_T(DL_I("i1", "a")), {DL_P "wcr", "x"}, E_BAD},
+    {"add: LOCAL leafref with target", DL_T(DL_GATE "<wc-v>x</wc-v>"), {DL_P "wcr", "x"}, E_OK},
+    /* LIST_SCOPE */
+    {"add: LIST_SCOPE must counts the children, too few", DL_T("<grp><name>g1</name><mem><name>a</name></mem></grp>"),
+        {DL_P "grp[name='g1']/need", "y"}, E_BAD},
+    {"add: LIST_SCOPE must counts the children, enough", DL_T("<grp><name>g1</name><mem><name>a</name></mem>"
+        "<mem><name>b</name></mem></grp>"), {DL_P "grp[name='g1']/need", "y"}, E_OK},
+    {"add: LIST_SCOPE reader of a template, component missing",
+        DL_T("<tpl><name>t1</name><comp><name>c1</name><cls>ok</cls></comp></tpl>"),
+        {DL_P "tpl[name='t1']/ifc[name='i1']/hw", "c9"}, E_BAD},
+    {"add: LIST_SCOPE reader of a template, component there",
+        DL_T("<tpl><name>t1</name><comp><name>c1</name><cls>ok</cls></comp></tpl>"),
+        {DL_P "tpl[name='t1']/ifc[name='i1']/hw", "c1"}, E_OK},
+    /* BOUNDED */
+    {"add: BOUNDED not() over a relative path finds what was added", DL_T(DL_G1 "<nx>y</nx></grp>"
+        "<grp><name>g2</name><mem><name>a</name></mem></grp>"), {DL_P "grp[name='g2']/mem[name='w1']", NULL}, E_BAD},
+    {"add: BOUNDED count() over a relative path finds what was added", DL_T(DL_G1 "<nc>y</nc></grp>"
+        "<grp><name>g2</name><mem><name>a</name></mem></grp>"), {DL_P "grp[name='g2']/mem[name='w1']", NULL}, E_BAD},
+    {"add: BOUNDED count() climbs on after a predicate, finds what was added", DL_T(DL_G1 "<mem><name>x</name></mem>"
+        "<pc><np>y</np></pc></grp><grp><name>g2</name><mem><name>a</name></mem></grp>"),
+        {DL_P "grp[name='g2']/mem[name='w1']", NULL}, E_BAD},
+    {"add: BOUNDED creation-safe reader, an unrelated instance is added",
+        DL_T(DL_I("i1", "good") DL_R("r", "<sel>i1</sel><m-val>y</m-val>")),
+        {DL_P "item[name='i2']/val", "bad"}, E_OK},
+    {"add: BOUNDED reader added, its target is missing", DL_T(DL_I("i1", "good")),
+        {DL_P "r[name='r2']/sel", "nope", DL_P "r[name='r2']/m-exist", "y"}, E_BAD},
+    /* UNBOUNDED */
+    {"add: UNBOUNDED upper bound count over an absolute path, one too many",
+        DL_T(DL_I("i1", "a") DL_I("i2", "a") DL_I("i3", "a") DL_R("r", "<m-cap>y</m-cap>")),
+        {DL_P "item[name='i4']/val", "a"}, E_BAD},
+    {"add: UNBOUNDED upper bound count over an absolute path, at the limit",
+        DL_T(DL_I("i1", "a") DL_I("i2", "a") DL_R("r", "<m-cap>y</m-cap>")), {DL_P "item[name='i3']/val", "a"}, E_OK},
+    {"add: UNBOUNDED lower bound count, an instance is added", DL_T(DL_I("i1", "a") DL_I("i2", "a")
+        DL_R("r", "<m-count>y</m-count>")), {DL_P "item[name='i3']/val", "a"}, E_OK},
+    {"add: UNBOUNDED reader added, leafref without target", DL_T(DL_I("i1", "a")), {DL_P "r[name='n']/lref", "nope"}, E_BAD},
+    {"add: UNBOUNDED when over another instance, the gate is missing", DL_T(DL_I("i1", "a") DL_R("r", "")),
+        {DL_P "r[name='r']/w-on", "v"}, E_BAD},
+    {"add: UNBOUNDED when over another instance, the gate is there", DL_T(DL_GATE DL_R("r", "")),
+        {DL_P "r[name='r']/w-on", "v"}, E_OK},
+    {"add: UNBOUNDED must counts the sibling instances, alone", DL_T("<inner><a>a</a></inner>"),
+        {DL_P "inner/x[name='x1']/chk", "y"}, E_BAD},
+    {"add: UNBOUNDED must counts the earlier siblings, first one", DL_T(DL_I("i1", "a")),
+        {DL_P "pos[name='a']/pp", "y"}, E_BAD},
+    {"add: structure, max-elements of a list", DL_C("c-neg", "<un><name>a</name></un><un><name>b</name></un>"
+        "<un><name>c</name></un>"), {"/dl:c-neg/un[name='d']", NULL}, E_BAD},
+    {"add: structure, unique value twice", DL_C("c-neg", "<un><name>a</name><u>1</u></un>"),
+        {"/dl:c-neg/un[name='b']/u", "1"}, E_BAD},
+    /* CASCADE */
+    {"add: CASCADE the when turns false, the node goes", DL_T(DL_G1 "<wn>y</wn></grp>"
+        "<grp><name>g2</name><mem><name>a</name></mem></grp>"), {DL_P "grp[name='g2']/mem[name='w1']", NULL}, E_OK},
+    {"add: CASCADE a default appears and another goes", DL_T(DL_I("i1", "a")) DZ_Z,
+        {DL_P "item[name='gate']/val", "a"}, E_OK},
+    /* the first adds, kept */
+    {"add a leaf in front of the one a rule reads", DL_T("<grp><name>g1</name><nf>y</nf></grp>"
+        "<grp><name>g2</name><lv>ok</lv></grp>"), {DL_P "grp[name='g2']/lv", "no"}, E_BAD},
+};
+
+/*
+ * What a modify can break. A modified leaf always re-checks the rules that read it, whatever the class and whether
+ * or not the rule is creation-safe.
+ */
+static const struct dl_case dl_modify_cases[] = {
+    /* LOCAL */
+    {"modify: LOCAL leafref target changes", DL_T(DL_GATE "<wc-v>a</wc-v><wcr>a</wcr>"), {DL_P "wc-v", "b"}, E_BAD},
+    {"modify: LOCAL leafref and target change together", DL_T(DL_GATE "<wc-v>a</wc-v><wcr>a</wcr>"),
+        {DL_P "wc-v", "b", DL_P "wcr", "b"}, E_OK},
+    /* LIST_SCOPE */
+    {"modify: LIST_SCOPE component class changes, an interface uses it",
+        DL_T("<tpl><name>t1</name><comp><name>c1</name><cls>ok</cls></comp>"
+        "<ifc><name>i1</name><hw>c1</hw></ifc></tpl>"), {DL_P "tpl[name='t1']/comp[name='c1']/cls", "no"}, E_BAD},
+    {"modify: LIST_SCOPE component class changes, nothing uses it",
+        DL_T("<tpl><name>t1</name><comp><name>c1</name><cls>ok</cls></comp><comp><name>c2</name><cls>ok</cls></comp>"
+        "<ifc><name>i1</name><hw>c1</hw></ifc></tpl>"), {DL_P "tpl[name='t1']/comp[name='c2']/cls", "no"}, E_OK},
+    /* BOUNDED */
+    {"modify: BOUNDED must reads the value of the instance it picks",
+        DL_T(DL_I("i1", "good") DL_R("r", "<sel>i1</sel><m-val>y</m-val>")), {DL_P "item[name='i1']/val", "bad"}, E_BAD},
+    {"modify: BOUNDED must, an unrelated instance changes",
+        DL_T(DL_I("i1", "good") DL_I("i2", "x") DL_R("r", "<sel>i1</sel><m-val>y</m-val>")),
+        {DL_P "item[name='i2']/val", "bad"}, E_OK},
+    {"modify: BOUNDED leafref to the value of the instance it picks",
+        DL_T(DL_I("i1", "v1") DL_R("r", "<sel>i1</sel><dref>v1</dref>")), {DL_P "item[name='i1']/val", "v2"}, E_BAD},
+    {"modify: BOUNDED not() over a relative path, the leaf it names changes",
+        DL_T(DL_G1 "<nx>y</nx></grp><grp><name>g2</name><mem><name>a</name></mem></grp>"),
+        {DL_P "grp[name='g1']/want", "a"}, E_BAD},
+    /* UNBOUNDED */
+    {"modify: UNBOUNDED must reads a leaf of a named instance",
+        DL_T("<item><name>i1</name><dd>z</dd></item>" DL_R("r", "<m-dd>y</m-dd>")), {DL_P "item[name='i1']/dd", "y"}, E_BAD},
+    {"modify: UNBOUNDED must, another instance changes",
+        DL_T("<item><name>i1</name><dd>z</dd></item>" DL_I("i2", "a") DL_R("r", "<m-dd>y</m-dd>")),
+        {DL_P "item[name='i2']/dd", "y"}, E_OK},
+    {"modify: UNBOUNDED must reads a leaf of another list instance",
+        DL_T("<grp><name>g1</name><mv>y</mv></grp><grp><name>g2</name><lv>ok</lv></grp>"),
+        {DL_P "grp[name='g2']/lv", "no"}, E_BAD},
+    {"modify: UNBOUNDED must reads a leaf of another list instance, a different instance changes",
+        DL_T("<grp><name>g1</name><mv>y</mv><lv>a</lv></grp><grp><name>g2</name><lv>ok</lv></grp>"),
+        {DL_P "grp[name='g1']/lv", "b"}, E_OK},
+    {"modify: UNBOUNDED must reads the text of a container",
+        DL_T("<inner><a>a</a><x><name>x1</name></x></inner>" DL_R("r", "<m-anc3>y</m-anc3>")),
+        {DL_P "inner/a", "bad"}, E_BAD},
+    {"modify: UNBOUNDED value keyed count, a value leaves its group",
+        DL_C("c-vk", "<vk><name>a</name><grp>g</grp></vk><vk><name>b</name><grp>g</grp></vk>"
+        "<vk><name>c</name><grp>g</grp></vk>"), {"/dl:c-vk/vk[name='c']/grp", "h"}, E_BAD},
+    /* CASCADE */
+    {"modify: CASCADE the when turns false, the node is dropped, a reader needs it",
+        DL_T(DL_R("r", "<sw>on</sw><dep>x</dep><m-dep>y</m-dep>")), {DL_P "r[name='r']/sw", "off"}, E_BAD},
+    {"modify: CASCADE the when turns false, the node is dropped, nothing reads it",
+        DL_T(DL_R("r", "<sw>on</sw><dep>x</dep>")), {DL_P "r[name='r']/sw", "off"}, E_OK},
+};
+
+/*
+ * Data an application stored without validating can hold a default node whose "when" never held. Whatever the edit
+ * touches, full validation drops it, so the incremental pass has to as well.
+ */
+static void
+test_stale_default_unrelated(void **state)
+{
+    const struct lys_module *mod;
+    struct lyd_node *before = NULL, *after = NULL, *full = NULL, *incr = NULL, *diff = NULL, *val_diff = NULL, *node;
+    uint32_t i;
+
+    dl_setup(state);
+    mod = ly_ctx_get_module_implemented(UTEST_LYCTX, "dl");
+    assert_non_null(mod);
+    assert_int_equal(LY_SUCCESS, lyd_parse_data_mem(UTEST_LYCTX, DL_T(DL_GATE DL_R("r", "<w-on>v</w-on>")) DL_LONE, LYD_XML,
+            LYD_PARSE_ONLY, 0, &before));
+    assert_int_equal(LY_SUCCESS, lyd_new_implicit_all(&before, UTEST_LYCTX, LYD_IMPLICIT_NO_STATE, NULL));
+    assert_int_equal(LY_SUCCESS, lyd_find_path(before, DL_P "r[name='r']/dw", 0, &node));
+    /* the leaf the default depends on is gone, no validation ran, the default stays with its "when" false */
+    assert_int_equal(LY_SUCCESS, lyd_find_path(before, DL_P "r[name='r']/w-on", 0, &node));
+    lyd_free_tree(node);
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, "/dl:lone/li[name='l2']", NULL, 0, NULL));
+
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(after, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &full));
+    assert_int_equal(LY_SUCCESS, lyd_validate_module(&full, mod, LYD_VALIDATE_NOT_FINAL, NULL));
+    assert_int_equal(LY_SUCCESS, lyd_validate_module_final(full, mod, 0));
+    assert_true(lyd_find_path(full, DL_P "r[name='r']/dw", 0, NULL) != LY_SUCCESS);
+
+    for (i = 0; i < sizeof incr_opt_sets / sizeof *incr_opt_sets; ++i) {
+        assert_int_equal(LY_SUCCESS, lyd_diff_siblings(before, after, 0, &diff));
+        assert_int_equal(LY_SUCCESS, lyd_dup_siblings(after, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &incr));
+        assert_int_equal(LY_SUCCESS, lyd_validate_module_incr(&incr, mod, diff,
+                incr_opt_sets[i] | LYD_VALIDATE_NOT_FINAL, &val_diff));
+        if (val_diff) {
+            assert_int_equal(LY_SUCCESS, lyd_diff_merge_all(&diff, val_diff, 0));
+            lyd_free_all(val_diff);
+            val_diff = NULL;
+        }
+        assert_int_equal(LY_SUCCESS, lyd_validate_module_incr_final(incr, mod, diff, incr_opt_sets[i]));
+        assert_true(lyd_find_path(incr, DL_P "r[name='r']/dw", 0, NULL) != LY_SUCCESS);
+        lyd_free_siblings(incr);
+        incr = NULL;
+        lyd_free_siblings(diff);
+        diff = NULL;
+    }
+
+    lyd_free_siblings(full);
+    lyd_free_siblings(after);
+    lyd_free_siblings(before);
+    ly_err_clean((struct ly_ctx *)UTEST_LYCTX, NULL);
+    dl_done();
+}
+
+static void
+test_add_relative_readers(void **state)
+{
+    dl_run(state, dl_add_cases, sizeof dl_add_cases / sizeof *dl_add_cases);
+}
+
+static void
+test_modify_rules(void **state)
+{
+    dl_run(state, dl_modify_cases, sizeof dl_modify_cases / sizeof *dl_modify_cases);
+}
+
+/*
+ * The rules of the product schema, one shape each. The names are not the product names, the expressions are. Every
+ * case is an add or a modify, and the expectation is what full validation says.
+ */
+#define PR_P "/dl:pr/"
+#define PR_T(x) DL_C("pr", x)
+#define PR_SH "<shaper><name>s1</name><single>y</single></shaper><shaper><name>s2</name><two>y</two></shaper>"
+#define PR_Q(d, sh) "<qprof><name>q1</name><queues><queue><name>a</name>" d "<shaper-name>" sh "</shaper-name></queue></queues></qprof>"
+#define PR_TM "<tmpl><name>t1</name><ifc><name>i1</name><v4>y</v4></ifc></tmpl><tmpl><name>t2</name><ifc><name>i1</name><v4>y</v4></ifc>" \
+        "<ifc><name>i2</name><v4>y</v4></ifc></tmpl><tmpl><name>t3</name><ifc><name>i9</name><v4>y</v4></ifc></tmpl>"
+#define PR_ONU(x) "<onu><name>o1</name><tref>t1</tref><term><name>x</name>" x "</term></onu>"
+#define PR_REV(c, r) "<comp><name>c1</name><revs>" c r "</revs></comp>"
+#define PR_TP(x) "<tp><name>p1</name><tcs>" x "</tcs></tp>"
+#define PR_TC(n, d) "<tc><position>" n "</position><duration>" d "</duration></tc>"
+#define PR_TS "<tsb><name>b1</name><pk><name>k1</name><fmt xmlns:dl=\"urn:tests:dl\">dl:fmt-ssh</fmt></pk></tsb><tsb><name>b2</name><pk><name>k2</name><fmt xmlns:dl=\"urn:tests:dl\">dl:fmt-other</fmt></pk></tsb>"
+static const struct dl_case dl_prod_cases[] = {
+    /* the queue shaper must: not(boolean(dual)) and boolean(shaper/single), or the same with dual and two */
+    {"product QoS: dual added, the shaper has only a single bucket", PR_T(PR_SH PR_Q("", "s1")),
+        {PR_P "qprof[name='q1']/queues/queue[name='a']/dual", "y"}, E_BAD},
+    {"product QoS: dual added and the shaper moved to the two bucket one", PR_T(PR_SH PR_Q("", "s1")),
+        {PR_P "qprof[name='q1']/queues/queue[name='a']/dual", "y", PR_P "qprof[name='q1']/queues/queue[name='a']/shaper-name", "s2"}, E_OK},
+    {"product QoS: dual removed, the shaper has only a two bucket", PR_T(PR_SH PR_Q("<dual>y</dual>", "s2")),
+        {"-" PR_P "qprof[name='q1']/queues/queue[name='a']/dual"}, E_BAD},
+    {"product QoS: single bucket removed from the shaper in use", PR_T(PR_SH PR_Q("", "s1")),
+        {"-" PR_P "shaper[name='s1']/single"}, E_BAD},
+    {"product QoS: two bucket added to the shaper in use, the single one stays", PR_T(PR_SH PR_Q("", "s1")),
+        {PR_P "shaper[name='s1']/two", "y"}, E_OK},
+    {"product QoS: shaper moved to one with only a two bucket", PR_T(PR_SH PR_Q("", "s1")),
+        {PR_P "qprof[name='q1']/queues/queue[name='a']/shaper-name", "s2"}, E_BAD},
+    {"product QoS: a shaper nobody uses gets a bucket", PR_T(PR_SH "<shaper><name>s3</name></shaper>" PR_Q("", "s1")),
+        {PR_P "shaper[name='s3']/two", "y"}, E_OK},
+    /* when over an absolute path, bounded and creation-safe */
+    {"product QoS: BOUNDED when, burst added, the shaper has a single bucket",
+        PR_T(PR_SH "<bq><name>b</name><sref>s1</sref></bq>"), {PR_P "bq[name='b']/burst", "y"}, E_OK},
+    {"product QoS: BOUNDED when, burst added, the shaper has no single bucket",
+        PR_T(PR_SH "<bq><name>b</name><sref>s2</sref></bq>"), {PR_P "bq[name='b']/burst", "y"}, E_BAD},
+    {"product QoS: CASCADE BOUNDED when, single bucket removed under a burst, the node is dropped",
+        PR_T(PR_SH "<bq><name>b</name><sref>s1</sref><burst>y</burst></bq>"), {"-" PR_P "shaper[name='s1']/single"}, E_OK},
+    {"product QoS: CASCADE BOUNDED when, sref moved under a burst, the node is dropped",
+        PR_T(PR_SH "<bq><name>b</name><sref>s1</sref><burst>y</burst></bq>"), {PR_P "bq[name='b']/sref", "s2"}, E_OK},
+    /* ancestor:: axis inside a predicate */
+    {"product ONU: interface not in the template of the ONU", PR_T(PR_TM PR_ONU("")),
+        {PR_P "onu[name='o1']/term[name='x']/ipif", "i2"}, E_BAD},
+    {"product ONU: interface in the template of the ONU", PR_T(PR_TM PR_ONU("")),
+        {PR_P "onu[name='o1']/term[name='x']/ipif", "i1"}, E_OK},
+    {"product ONU: the address of the interface is removed from the template", PR_T(PR_TM PR_ONU("<ipif>i1</ipif>")),
+        {"-" PR_P "tmpl[name='t1']/ifc[name='i1']/v4"}, E_BAD},
+    {"product ONU: the v4 address is removed, a v6 one stays", PR_T(PR_TM PR_ONU("<ipif>i1</ipif>")),
+        {PR_P "tmpl[name='t1']/ifc[name='i1']/v6", "y", "-" PR_P "tmpl[name='t1']/ifc[name='i1']/v4"}, E_OK},
+    {"product ONU: the ONU moves to a template without the interface", PR_T(PR_TM PR_ONU("<ipif>i1</ipif>")),
+        {PR_P "onu[name='o1']/tref", "t3"}, E_BAD},
+    {"product ONU: the ONU moves to a template with the interface", PR_T(PR_TM PR_ONU("<ipif>i1</ipif>")),
+        {PR_P "onu[name='o1']/tref", "t2"}, E_OK},
+    {"product ONU: LOCAL leafref to a sibling instance, missing", PR_T(PR_TM PR_ONU("")),
+        {PR_P "onu[name='o1']/term[name='y']/peer", "nope"}, E_BAD},
+    {"product ONU: LOCAL leafref to a sibling instance, there", PR_T(PR_TM PR_ONU("")),
+        {PR_P "onu[name='o1']/term[name='y']/peer", "x"}, E_OK},
+    /* when with boolean(), derived-from() and count() over the siblings */
+    {"product SWM: when boolean(capability=x), the leaf is added and the capability fits",
+        PR_T(PR_REV("<cap>alias</cap>", "<rev><name>r1</name><state>available</state></rev>")),
+        {PR_P "comp[name='c1']/revs/rev[name='r1']/alias", "y"}, E_OK},
+    {"product SWM: when boolean(capability=x), the leaf is added and the capability does not fit",
+        PR_T(PR_REV("<cap>other</cap>", "<rev><name>r1</name><state>available</state></rev>")),
+        {PR_P "comp[name='c1']/revs/rev[name='r1']/alias", "y"}, E_BAD},
+    {"product SWM: CASCADE when boolean(capability=x), the capability changes under the leaf, the node is dropped",
+        PR_T(PR_REV("<cap>alias</cap>", "<rev><name>r1</name><state>available</state><alias>y</alias></rev>")),
+        {PR_P "comp[name='c1']/revs/cap", "other"}, E_OK},
+    {"product SWM: when with a state test, the state fits",
+        PR_T(PR_REV("<cap>act</cap>", "<rev><name>r1</name><state>in-use</state></rev>")),
+        {PR_P "comp[name='c1']/revs/rev[name='r1']/act", "y"}, E_OK},
+    {"product SWM: when with a state test, the state does not fit",
+        PR_T(PR_REV("<cap>act</cap>", "<rev><name>r1</name><state>new</state></rev>")),
+        {PR_P "comp[name='c1']/revs/rev[name='r1']/act", "y"}, E_BAD},
+    {"product SWM: CASCADE when with a state test, the state changes under the leaf, the node is dropped",
+        PR_T(PR_REV("<cap>act</cap>", "<rev><name>r1</name><state>available</state><act>y</act></rev>")),
+        {PR_P "comp[name='c1']/revs/rev[name='r1']/state", "new"}, E_OK},
+    {"product SWM: CASCADE plain derived-from(), capability changes under the leaf, the node is dropped",
+        PR_T(PR_REV("<dcap xmlns:dl=\"urn:tests:dl\">dl:cap-sub</dcap>", "<rev><name>r1</name><state>available</state><fin>y</fin></rev>")),
+        {PR_P "comp[name='c1']/revs/dcap", "cap-other"}, E_OK},
+    {"product SWM: derived-from() and count()=0, download added, nothing downloads",
+        PR_T(PR_REV("<dcap xmlns:dl=\"urn:tests:dl\">dl:cap-sub</dcap>", "<rev><name>r1</name><state>available</state></rev>")),
+        {PR_P "comp[name='c1']/revs/download", "y"}, E_OK},
+    {"product SWM: derived-from() and count()=0, download added while a revision downloads",
+        PR_T(PR_REV("<dcap xmlns:dl=\"urn:tests:dl\">dl:cap-sub</dcap>", "<rev><name>r1</name><state>downloading</state></rev>")),
+        {PR_P "comp[name='c1']/revs/download", "y"}, E_BAD},
+    {"product SWM: CASCADE count()=0, a revision starts to download under the leaf, the node is dropped",
+        PR_T(PR_REV("<dcap xmlns:dl=\"urn:tests:dl\">dl:cap-sub</dcap>", "<rev><name>r1</name><state>available</state></rev><download>y</download>")),
+        {PR_P "comp[name='c1']/revs/rev[name='r1']/state", "downloading"}, E_OK},
+    {"product SWM: CASCADE count()=0, a revision that downloads is added under the leaf, the node is dropped",
+        PR_T(PR_REV("<dcap xmlns:dl=\"urn:tests:dl\">dl:cap-sub</dcap>", "<rev><name>r1</name><state>available</state></rev><download>y</download>")),
+        {PR_P "comp[name='c1']/revs/rev[name='r2']/state", "downloading"}, E_OK},
+    {"product SWM: count()=0, a revision that does not download is added under the leaf",
+        PR_T(PR_REV("<dcap xmlns:dl=\"urn:tests:dl\">dl:cap-sub</dcap>", "<rev><name>r1</name><state>available</state></rev><download>y</download>")),
+        {PR_P "comp[name='c1']/revs/rev[name='r2']/state", "available"}, E_OK},
+    {"product SWM: CASCADE derived-from(), capability changes under the download leaf, the node is dropped",
+        PR_T(PR_REV("<dcap xmlns:dl=\"urn:tests:dl\">dl:cap-sub</dcap>", "<rev><name>r1</name><state>available</state></rev><download>y</download>")),
+        {PR_P "comp[name='c1']/revs/dcap", "cap-other"}, E_OK},
+    /* a list keyed by position, and rules that read the leaf named position */
+    {"product tone: the next position is added", PR_T(PR_TP(PR_TC("1", "a") PR_TC("2", "b"))),
+        {PR_P "tp[name='p1']/tcs/tc[position='3']/duration", "c"}, E_OK},
+    {"product tone: a position is added after a gap", PR_T(PR_TP(PR_TC("1", "a") PR_TC("2", "b"))),
+        {PR_P "tp[name='p1']/tcs/tc[position='5']/duration", "c"}, E_BAD},
+    {"product tone: repetition added, the last component is not continuous", PR_T(PR_TP(PR_TC("1", "a") PR_TC("2", "b"))),
+        {PR_P "tp[name='p1']/tcs/rb", "y"}, E_OK},
+    {"product tone: repetition added, the last component is continuous", PR_T(PR_TP(PR_TC("1", "a") PR_TC("2", "continuous"))),
+        {PR_P "tp[name='p1']/tcs/rb", "y"}, E_BAD},
+    {"product tone: repetition added, only one component", PR_T(PR_TP(PR_TC("1", "a"))),
+        {PR_P "tp[name='p1']/tcs/rb", "y"}, E_BAD},
+    {"product tone: CASCADE the last component becomes continuous under the repetition, the node is dropped",
+        PR_T(PR_TP(PR_TC("1", "a") PR_TC("2", "b") "<rb>y</rb>")),
+        {PR_P "tp[name='p1']/tcs/tc[position='2']/duration", "continuous"}, E_OK},
+    {"product tone: CASCADE a continuous component is added last under the repetition, the node is dropped",
+        PR_T(PR_TP(PR_TC("1", "a") PR_TC("2", "b") "<rb>y</rb>")),
+        {PR_P "tp[name='p1']/tcs/tc[position='3']/duration", "continuous"}, E_OK},
+    /* deref() with a predicate that has not(derived-from-or-self()) inside */
+    {"product truststore: the format of a key in use changes", PR_T(PR_TS "<usr><name>u1</name><ref>b1</ref></usr>"),
+        {PR_P "tsb[name='b1']/pk[name='k1']/fmt", "fmt-other"}, E_BAD},
+    {"product truststore: a key with another format is added to the bag in use", PR_T(PR_TS "<usr><name>u1</name><ref>b1</ref></usr>"),
+        {PR_P "tsb[name='b1']/pk[name='k3']/fmt", "fmt-other"}, E_BAD},
+    {"product truststore: a key with the right format is added to the bag in use", PR_T(PR_TS "<usr><name>u1</name><ref>b1</ref></usr>"),
+        {PR_P "tsb[name='b1']/pk[name='k3']/fmt", "fmt-ssh"}, E_OK},
+    {"product truststore: a bag with another format is not used, its key changes", PR_T(PR_TS "<usr><name>u1</name><ref>b1</ref></usr>"),
+        {PR_P "tsb[name='b2']/pk[name='k2']/fmt", "fmt-ssh"}, E_OK},
+    {"product truststore: a user is added on the good bag", PR_T(PR_TS "<usr><name>u1</name><ref>b1</ref></usr>"),
+        {PR_P "usr[name='u2']/ref", "b1"}, E_OK},
+    {"product truststore: a user is added on the bag with another format", PR_T(PR_TS "<usr><name>u1</name><ref>b1</ref></usr>"),
+        {PR_P "usr[name='u2']/ref", "b2"}, E_BAD},
+    {"product truststore: a user moves to the bag with another format", PR_T(PR_TS "<usr><name>u1</name><ref>b1</ref></usr>"),
+        {PR_P "usr[name='u1']/ref", "b2"}, E_BAD},
+};
+
+static void
+test_product_shapes(void **state)
+{
+    dl_run(state, dl_prod_cases, sizeof dl_prod_cases / sizeof *dl_prod_cases);
+}
+
+static void
+test_del_yang_probe(void **state)
+{
+    dl_run(state, dl_probe_cases, sizeof dl_probe_cases / sizeof *dl_probe_cases);
 }
 
 static void
@@ -3044,6 +3545,11 @@ main(void)
         UTEST(test_del_sweep_by_reader),
         UTEST(test_del_childless_diff),
         UTEST(test_del_ancestor_reader),
+        UTEST(test_del_yang_probe),
+        UTEST(test_add_relative_readers),
+        UTEST(test_modify_rules),
+        UTEST(test_product_shapes),
+        UTEST(test_stale_default_unrelated),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);
