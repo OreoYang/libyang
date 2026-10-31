@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "compat.h"
 #include "diff.h"
 #include "ly_common.h"
 #include "parser_data.h"
@@ -136,12 +137,17 @@ lyd_val_incr_diff_op(const struct lyd_node *diff_node, enum lyd_diff_op *op)
 
 /**
  * @brief Add a schema node and everything below it to a set of touched schema nodes.
+ *
+ * Nodes only ever enter the set together with their whole subtree, so a node already in it needs no walk.
  */
 static LY_ERR
 lyd_val_incr_touch(struct ly_set *set, const struct lysc_node *snode)
 {
     const struct lysc_node *elem;
 
+    if (ly_set_contains(set, (void *)snode, NULL)) {
+        return LY_SUCCESS;
+    }
     LYSC_TREE_DFS_BEGIN(snode, elem) {
         LY_CHECK_RET(ly_set_add(set, (void *)elem, 0, NULL));
         LYSC_TREE_DFS_END(snode, elem);
@@ -404,8 +410,9 @@ lyd_val_incr_add_root(struct lyd_val_incr *incr, struct lyd_node *root)
     }
     LY_CHECK_RET(ly_set_add(&incr->roots, root, 1, NULL));
 
+    /* the path is only searched, a duplicate costs less than the scan to avoid it */
     for (iter = root; iter; iter = lyd_parent(iter)) {
-        LY_CHECK_RET(ly_set_add(&incr->path, iter, 0, NULL));
+        LY_CHECK_RET(ly_set_add(&incr->path, iter, 1, NULL));
     }
     return LY_SUCCESS;
 }
@@ -471,7 +478,7 @@ lyd_val_incr_add_shallow(struct lyd_val_incr *incr, struct lyd_node *parent)
 
     LY_CHECK_RET(ly_set_add(&incr->shallow, parent, 0, NULL));
     for (iter = parent; iter; iter = lyd_parent(iter)) {
-        LY_CHECK_RET(ly_set_add(&incr->path, iter, 0, NULL));
+        LY_CHECK_RET(ly_set_add(&incr->path, iter, 1, NULL));
     }
     return LY_SUCCESS;
 }
@@ -711,7 +718,8 @@ lyd_val_incr_extra(const struct lyd_node *tree, const struct lys_module *mod, co
                 LYD_TREE_DFS_continue = 1;
             } else if (ly_set_contains(wanted, (void *)elem->schema, NULL) &&
                     !ly_set_contains(&incr->roots, (void *)elem, NULL)) {
-                LY_CHECK_RET(ly_set_add(&incr->extra, (void *)elem, 0, NULL));
+                /* the walk meets every node once */
+                LY_CHECK_RET(ly_set_add(&incr->extra, (void *)elem, 1, NULL));
             }
             LYD_TREE_DFS_END(sibling, elem);
         }
@@ -954,28 +962,82 @@ lyd_validate_incr_stats(const struct ly_ctx *ctx, uint64_t *calls, uint64_t *fal
 }
 
 /**
+ * @brief Callback for checking node pointer HT value equality.
+ */
+static ly_bool
+lyd_val_incr_ptr_equal_cb(void *val1_p, void *val2_p, ly_bool UNUSED(mod), void *UNUSED(cb_data))
+{
+    return *(void **)val1_p == *(void **)val2_p;
+}
+
+/**
+ * @brief Add a node to a queue unless it is already queued.
+ *
+ * @param[in,out] queue Queue to add to.
+ * @param[in] ht Hash table holding every node in @p queue, @p node is added to it.
+ * @param[in] node Node to add.
+ * @return LY_ERR value.
+ */
+static LY_ERR
+lyd_val_incr_queue(struct ly_set *queue, struct ly_ht *ht, struct lyd_node *node)
+{
+    LY_ERR r;
+
+    r = lyht_insert(ht, &node, lyht_hash((const char *)&node, sizeof node), NULL);
+    if (r == LY_EEXIST) {
+        return LY_SUCCESS;
+    }
+    LY_CHECK_RET(r);
+    return ly_set_add(queue, node, 1, NULL);
+}
+
+/**
  * @brief Re-register the unresolved parts of a node that the scoped subtree walk did not visit.
  */
 static LY_ERR
 lyd_val_incr_unres_extra(const struct lyd_val_incr *incr, struct ly_set *node_when, struct ly_set *node_types)
 {
+    struct ly_set *queue[2] = {node_when, node_types};
+    struct ly_ht *ht[2] = {NULL};
     struct lyd_node *node;
-    uint32_t i;
+    uint32_t i, q;
+    LY_ERR r, rc = LY_SUCCESS;
+
+    if (!incr->extra.count) {
+        return LY_SUCCESS;
+    }
+
+    /* the earlier passes may have queued the same node already and a duplicate would be used after the
+     * autodeletion frees it; the queues and the extra nodes are large, so look the queued nodes up by hash */
+    for (q = 0; q < 2; ++q) {
+        ht[q] = lyht_new(lyht_get_fixed_size(queue[q]->count + incr->extra.count), sizeof node,
+                lyd_val_incr_ptr_equal_cb, NULL, 1);
+        LY_CHECK_ERR_GOTO(!ht[q], LOGMEM(NULL); rc = LY_EMEM, cleanup);
+        for (i = 0; i < queue[q]->count; ++i) {
+            node = queue[q]->dnodes[i];
+            r = lyht_insert(ht[q], &node, lyht_hash((const char *)&node, sizeof node), NULL);
+            LY_CHECK_ERR_GOTO(r && (r != LY_EEXIST), rc = r, cleanup);
+        }
+    }
 
     for (i = 0; i < incr->extra.count; ++i) {
         node = incr->extra.dnodes[i];
 
-        /* the earlier passes may have queued the same node already and a duplicate would be used after the
-         * autodeletion frees it */
         if (lysc_has_when(node->schema)) {
-            LY_CHECK_RET(ly_set_add(node_when, node, 0, NULL));
+            rc = lyd_val_incr_queue(node_when, ht[0], node);
+            LY_CHECK_GOTO(rc, cleanup);
         }
         if ((node->schema->nodetype & LYD_NODE_TERM) &&
                 ((struct lysc_node_leaf *)node->schema)->type->plugin->validate) {
-            LY_CHECK_RET(ly_set_add(node_types, node, 0, NULL));
+            rc = lyd_val_incr_queue(node_types, ht[1], node);
+            LY_CHECK_GOTO(rc, cleanup);
         }
     }
-    return LY_SUCCESS;
+
+cleanup:
+    lyht_free(ht[0], NULL);
+    lyht_free(ht[1], NULL);
+    return rc;
 }
 
 /**
