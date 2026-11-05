@@ -2884,6 +2884,16 @@ static const char *schema_dl =
         "    list mxl { key name; max-elements 2; leaf name { type string; } }\n"
         "    list mnl { key name; min-elements 2; leaf name { type string; } }\n"
         "}\n"
+        /* what the when rules of dm read: an instance with a type (identity) and a selector, and a profile it selects */
+        "container xw {\n"
+        "    list e {\n"
+        "        key name;\n"
+        "        leaf name { type string; }\n"
+        "        leaf kind { type identityref { base cap-base; } }\n"
+        "        leaf sel { type string; }\n"
+        "    }\n"
+        "    list prof { key name; leaf name { type string; } leaf mode { type string; } leaf pk { type identityref { base cap-base; } } }\n"
+        "}\n"
         "}";
 
 static const char *schema_dm =
@@ -2916,6 +2926,43 @@ static const char *schema_dm =
         "        leaf xm-must { type string; must \"not(../dl:b)\"; }\n"
         "        leaf xc-must { type string; must \"count(../dl:c) >= 1\"; }\n"
         "        leaf xl-ref { type leafref { path \"../dl:d\"; } }\n"
+        "    }\n"
+        /*
+         * The when rules of dl seen from dm, one for each shape the production schemas have: where the when sits
+         * (the augment or the node), how far up it reads, whether it selects by a key or reads every instance,
+         * whether it negates, and whether the node can be created by the validation itself (a container without
+         * presence). Every rule reads data of dl, so every rule is a rule of another module.
+         */
+        /* augment: LOCAL, read from the augmented list */
+        "    augment \"/dl:xw/dl:e\" {\n"
+        "        when \"derived-from-or-self(dl:kind, 'dl:cap-sub')\";\n"
+        "        leaf x1 { type string; }\n"
+        "    }\n"
+        "    augment \"/dl:xw/dl:e\" {\n"
+        "        when \"dl:sel = 'a'\";\n"
+        "        container x6 { leaf v { type string; } }\n"
+        "        leaf x12 { type string; }\n"
+        "    }\n"
+        /* augment: BOUNDED, negating, selects a profile by the name of the augmented list */
+        "    augment \"/dl:xw/dl:e\" {\n"
+        "        when \"derived-from-or-self(dl:kind, 'dl:cap-sub') and (not(/dl:xw/dl:prof[dl:name=current()/dl:name]/dl:mode = 'net'))\";\n"
+        "        leaf x10 { type string; }\n"
+        "    }\n"
+        "    augment \"/dl:xw/dl:e\" {\n"
+        /* node: UNBOUNDED, any instance */
+        "        leaf x2 { type string; when \"derived-from-or-self(/dl:xw/dl:e/dl:kind, 'dl:cap-sub')\"; }\n"
+        /* node: LOCAL, two levels below the list */
+        /* the other leaf keeps the container, so the node that is dropped is the one with the when */
+        "        container x3c { leaf k { type string; } container x3 { when \"derived-from-or-self(../../dl:kind, 'dl:cap-sub')\"; leaf v { type string; } } }\n"
+        "        container x4c { leaf k { type string; } leaf x4 { type string; when \"derived-from-or-self(../../dl:kind, 'dl:cap-sub')\"; } }\n"
+        /* node: BOUNDED, a profile selected by the node */
+        "        leaf x5 { type string; when \"/dl:xw/dl:prof[dl:name = current()/../dl:sel]/dl:mode = 'x'\"; }\n"
+        "        leaf x7 { type string; when \"derived-from-or-self(/dl:xw/dl:prof[dl:name = current()/../dl:sel]/dl:pk, 'dl:cap-sub')\"; }\n"
+        "        container x9 { when \"derived-from-or-self(/dl:xw/dl:prof[dl:name = current()/../dl:sel]/dl:pk, 'dl:cap-sub')\"; leaf v { type string; } }\n"
+        /* node: LOCAL, one level up */
+        "        leaf x8 { type string; when \"derived-from-or-self(../dl:kind, 'dl:cap-sub')\"; }\n"
+        "        container x11 { when \"../dl:sel = 'a'\"; leaf v { type string; } }\n"
+        "        leaf x13 { type string; when \"not(../dl:sel) or derived-from(../dl:kind, 'dl:cap-sub')\"; }\n"
         "    }\n"
         "}";
 
@@ -3906,6 +3953,154 @@ test_gap_shapes(void **state)
     dl_run(state, dl_gp_cases, sizeof dl_gp_cases / sizeof *dl_gp_cases);
 }
 
+/*
+ * Rules of dm that read data of dl, one set of cases for each shape of a cross-module when in the production schemas
+ * (see the dm augments x1 to x13). Each shape gets the edit that adds the node while its when is false, the same
+ * edit while the when is true, and the edit that turns the when false for a node that is there already, which
+ * the validation answers by dropping the node.
+ */
+#define XW_P "/dl:xw/"
+#define XW_T(x) DL_C("xw", x)
+#define XW_E(n, x) "<e><name>" n "</name>" x "</e>"
+#define XW_E1 XW_P "e[name='e1']/"
+#define XW_SUB "<kind xmlns:dl=\"urn:tests:dl\">dl:cap-sub</kind>"
+#define XW_OTH "<kind xmlns:dl=\"urn:tests:dl\">dl:cap-other</kind>"
+#define XW_PROF(n, x) "<prof><name>" n "</name>" x "</prof>"
+#define XW_PSUB "<pk xmlns:dl=\"urn:tests:dl\">dl:cap-sub</pk>"
+#define XW_POTH "<pk xmlns:dl=\"urn:tests:dl\">dl:cap-other</pk>"
+#define XW_DM(n, x) "<" n " xmlns=\"urn:tests:dm\">" x "</" n ">"
+#define XW_SEL(v) "<sel>" v "</sel>"
+#define XW_P1 XW_P "prof[name='p1']/"
+static const struct dl_case dl_xw_cases[] = {
+    /* augment when, LOCAL derived-from() of a leaf of the augmented list */
+    {"xmod when x1 LOCAL augment derived-from(): added while false", XW_T(XW_E("e1", XW_OTH)), {XW_E1 "dm:x1", "v"}, E_BAD},
+    {"xmod when x1 LOCAL augment derived-from(): added while true", XW_T(XW_E("e1", XW_SUB)), {XW_E1 "dm:x1", "v"}, E_OK},
+    {"xmod when x1 LOCAL augment derived-from(): CASCADE the type changes, the node is dropped",
+        XW_T(XW_E("e1", XW_SUB XW_DM("x1", "v"))), {XW_E1 "kind", "dl:cap-other"}, E_OK},
+    /* UNBOUNDED derived-from() over every instance of the list */
+    {"xmod when x2 UNBOUNDED derived-from(): added while no instance has the type",
+        XW_T(XW_E("e1", XW_OTH)), {XW_E1 "dm:x2", "v"}, E_BAD},
+    {"xmod when x2 UNBOUNDED derived-from(): added while another instance has the type",
+        XW_T(XW_E("e1", XW_OTH) XW_E("e2", XW_SUB)), {XW_E1 "dm:x2", "v"}, E_OK},
+    {"xmod when x2 UNBOUNDED derived-from(): CASCADE the last instance with the type changes",
+        XW_T(XW_E("e1", XW_SUB XW_DM("x2", "v"))), {XW_E1 "kind", "dl:cap-other"}, E_OK},
+    /* LOCAL, two levels below the list, a container without presence (the validation can create it) and a leaf */
+    {"xmod when x3 LOCAL ups 2 implicit container: added while false",
+        XW_T(XW_E("e1", XW_OTH)), {XW_E1 "dm:x3c/dm:x3/dm:v", "q"}, E_BAD},
+    {"xmod when x3 LOCAL ups 2 implicit container: added while true",
+        XW_T(XW_E("e1", XW_SUB)), {XW_E1 "dm:x3c/dm:x3/dm:v", "q"}, E_OK},
+    {"xmod when x3 LOCAL ups 2 implicit container: CASCADE the type changes, the container is dropped",
+        XW_T(XW_E("e1", XW_SUB XW_DM("x3c", "<k>k</k><x3><v>q</v></x3>"))), {XW_E1 "kind", "dl:cap-other"}, E_OK},
+    {"xmod when x4 LOCAL ups 2 leaf: added while false",
+        XW_T(XW_E("e1", XW_OTH)), {XW_E1 "dm:x4c/dm:x4", "q"}, E_BAD},
+    {"xmod when x4 LOCAL ups 2 leaf: added while true",
+        XW_T(XW_E("e1", XW_SUB)), {XW_E1 "dm:x4c/dm:x4", "q"}, E_OK},
+    {"xmod when x4 LOCAL ups 2 leaf: CASCADE the type changes, the leaf is dropped",
+        XW_T(XW_E("e1", XW_SUB XW_DM("x4c", "<k>k</k><x4>q</x4>"))), {XW_E1 "kind", "dl:cap-other"}, E_OK},
+    /* BOUNDED, a profile of dl selected by a leaf of the augmented list: comparison, derived-from(), implicit container */
+    {"xmod when x5 BOUNDED selected profile, comparison: added while false",
+        XW_T(XW_E("e1", XW_SEL("p1")) XW_PROF("p1", "<mode>y</mode>")), {XW_E1 "dm:x5", "v"}, E_BAD},
+    {"xmod when x5 BOUNDED selected profile, comparison: added while true",
+        XW_T(XW_E("e1", XW_SEL("p1")) XW_PROF("p1", "<mode>x</mode>")), {XW_E1 "dm:x5", "v"}, E_OK},
+    {"xmod when x5 BOUNDED selected profile, comparison: CASCADE the profile changes",
+        XW_T(XW_E("e1", XW_SEL("p1") XW_DM("x5", "v")) XW_PROF("p1", "<mode>x</mode>")), {XW_P1 "mode", "y"}, E_OK},
+    {"xmod when x7 BOUNDED selected profile, derived-from(): added while false",
+        XW_T(XW_E("e1", XW_SEL("p1")) XW_PROF("p1", XW_POTH)), {XW_E1 "dm:x7", "v"}, E_BAD},
+    {"xmod when x7 BOUNDED selected profile, derived-from(): added while true",
+        XW_T(XW_E("e1", XW_SEL("p1")) XW_PROF("p1", XW_PSUB)), {XW_E1 "dm:x7", "v"}, E_OK},
+    {"xmod when x7 BOUNDED selected profile, derived-from(): CASCADE the profile type changes",
+        XW_T(XW_E("e1", XW_SEL("p1") XW_DM("x7", "v")) XW_PROF("p1", XW_PSUB)), {XW_P1 "pk", "dl:cap-other"}, E_OK},
+    {"xmod when x7 BOUNDED selected profile, derived-from(): CASCADE the selector moves to a profile that fails",
+        XW_T(XW_E("e1", XW_SEL("p1") XW_DM("x7", "v")) XW_PROF("p1", XW_PSUB) XW_PROF("p2", XW_POTH)),
+        {XW_E1 "sel", "p2"}, E_OK},
+    {"xmod when x9 BOUNDED selected profile, derived-from() implicit container: added while false",
+        XW_T(XW_E("e1", XW_SEL("p1")) XW_PROF("p1", XW_POTH)), {XW_E1 "dm:x9/dm:v", "q"}, E_BAD},
+    {"xmod when x9 BOUNDED selected profile, derived-from() implicit container: added while true",
+        XW_T(XW_E("e1", XW_SEL("p1")) XW_PROF("p1", XW_PSUB)), {XW_E1 "dm:x9/dm:v", "q"}, E_OK},
+    {"xmod when x9 BOUNDED selected profile, derived-from() implicit container: CASCADE the profile type changes",
+        XW_T(XW_E("e1", XW_SEL("p1") XW_DM("x9", "<v>q</v>")) XW_PROF("p1", XW_PSUB)), {XW_P1 "pk", "dl:cap-other"}, E_OK},
+    /* augment when, LOCAL comparison (no function), a leaf and a container without presence */
+    {"xmod when x12 LOCAL augment comparison: added while false",
+        XW_T(XW_E("e1", XW_SEL("b"))), {XW_E1 "dm:x12", "v"}, E_BAD},
+    {"xmod when x12 LOCAL augment comparison: added while true",
+        XW_T(XW_E("e1", XW_SEL("a"))), {XW_E1 "dm:x12", "v"}, E_OK},
+    {"xmod when x12 LOCAL augment comparison: CASCADE the leaf changes, the node is dropped",
+        XW_T(XW_E("e1", XW_SEL("a") XW_DM("x12", "v"))), {XW_E1 "sel", "b"}, E_OK},
+    {"xmod when x6 LOCAL augment comparison implicit container: added while false",
+        XW_T(XW_E("e1", XW_SEL("b"))), {XW_E1 "dm:x6/dm:v", "q"}, E_BAD},
+    {"xmod when x6 LOCAL augment comparison implicit container: added while true",
+        XW_T(XW_E("e1", XW_SEL("a"))), {XW_E1 "dm:x6/dm:v", "q"}, E_OK},
+    {"xmod when x6 LOCAL augment comparison implicit container: CASCADE the leaf changes, the container is dropped",
+        XW_T(XW_E("e1", XW_SEL("a") XW_DM("x6", "<v>q</v>"))), {XW_E1 "sel", "b"}, E_OK},
+    /* node when, LOCAL one level up */
+    {"xmod when x8 LOCAL ups 1 derived-from(): added while false", XW_T(XW_E("e1", XW_OTH)), {XW_E1 "dm:x8", "v"}, E_BAD},
+    {"xmod when x8 LOCAL ups 1 derived-from(): added while true", XW_T(XW_E("e1", XW_SUB)), {XW_E1 "dm:x8", "v"}, E_OK},
+    {"xmod when x8 LOCAL ups 1 derived-from(): CASCADE the type changes, the node is dropped",
+        XW_T(XW_E("e1", XW_SUB XW_DM("x8", "v"))), {XW_E1 "kind", "dl:cap-other"}, E_OK},
+    {"xmod when x11 LOCAL ups 1 comparison implicit container: added while false",
+        XW_T(XW_E("e1", XW_SEL("b"))), {XW_E1 "dm:x11/dm:v", "q"}, E_BAD},
+    {"xmod when x11 LOCAL ups 1 comparison implicit container: added while true",
+        XW_T(XW_E("e1", XW_SEL("a"))), {XW_E1 "dm:x11/dm:v", "q"}, E_OK},
+    {"xmod when x11 LOCAL ups 1 comparison implicit container: CASCADE the leaf changes, the container is dropped",
+        XW_T(XW_E("e1", XW_SEL("a") XW_DM("x11", "<v>q</v>"))), {XW_E1 "sel", "b"}, E_OK},
+    {"xmod when x13 LOCAL ups 1 not() or derived-from(): added while false",
+        XW_T(XW_E("e1", XW_SEL("b") XW_OTH)), {XW_E1 "dm:x13", "v"}, E_BAD},
+    {"xmod when x13 LOCAL ups 1 not() or derived-from(): added while the leaf is absent",
+        XW_T(XW_E("e1", XW_OTH)), {XW_E1 "dm:x13", "v"}, E_OK},
+    {"xmod when x13 LOCAL ups 1 not() or derived-from(): CASCADE the negated leaf appears, the node is dropped",
+        XW_T(XW_E("e1", XW_OTH XW_DM("x13", "v"))), {XW_E1 "sel", "b"}, E_OK},
+    /* augment when, BOUNDED and negating: a type and a selected profile that must not be of a mode */
+    {"xmod when x10 BOUNDED augment not() and derived-from(): added while the type is wrong",
+        XW_T(XW_E("e1", XW_OTH)), {XW_E1 "dm:x10", "v"}, E_BAD},
+    {"xmod when x10 BOUNDED augment not() and derived-from(): added while the profile has the mode",
+        XW_T(XW_E("e1", XW_SUB) XW_PROF("e1", "<mode>net</mode>")), {XW_E1 "dm:x10", "v"}, E_BAD},
+    {"xmod when x10 BOUNDED augment not() and derived-from(): added while both hold",
+        XW_T(XW_E("e1", XW_SUB) XW_PROF("e1", "<mode>other</mode>")), {XW_E1 "dm:x10", "v"}, E_OK},
+    {"xmod when x10 BOUNDED augment not() and derived-from(): CASCADE the profile with the mode appears",
+        XW_T(XW_E("e1", XW_SUB XW_DM("x10", "v"))), {XW_P "prof[name='e1']/mode", "net"}, E_OK},
+    {"xmod when x10 BOUNDED augment not() and derived-from(): CASCADE the type changes",
+        XW_T(XW_E("e1", XW_SUB XW_DM("x10", "v"))), {XW_E1 "kind", "dl:cap-other"}, E_OK},
+};
+
+static void
+test_xmod_when_shapes(void **state)
+{
+    dl_run(state, dl_xw_cases, sizeof dl_xw_cases / sizeof *dl_xw_cases);
+}
+
+/*
+ * The leafref and must shapes that need a rejected edit of an action the other cases do not have: a leafref
+ * to an absolute path that is replaced, one of another module that is added, and a must that counts the nodes
+ * with its own value, whose counted node is given that value.
+ */
+static const struct dl_case dl_ref_cases[] = {
+    {"UNBOUNDED absolute leafref, the value is replaced by one without a target",
+        DL_T(DL_I("i1", "k1") DL_I("i2", "good")) DL_C("st", "<s><name>n1</name><sref>i2</sref></s>"),
+        {"/dl:st/s[name='n1']/sref", "nope"}, E_BAD},
+    {"UNBOUNDED absolute leafref, the value is replaced by one with a target",
+        DL_T(DL_I("i1", "k1") DL_I("i2", "good")) DL_C("st", "<s><name>n1</name><sref>i2</sref></s>"),
+        {"/dl:st/s[name='n1']/sref", "i1"}, E_OK},
+    {"UNBOUNDED absolute leafref of another module, added with no target",
+        DL_T(DL_I("i1", "k1")) "<mtop xmlns=\"urn:tests:dm\"><mr><name>m1</name></mr></mtop>",
+        {"/dm:mtop/mr[name='m1']/iref", "nope"}, E_BAD},
+    {"UNBOUNDED absolute leafref of another module, added with a target",
+        DL_T(DL_I("i1", "k1")) "<mtop xmlns=\"urn:tests:dm\"><mr><name>m1</name></mr></mtop>",
+        {"/dm:mtop/mr[name='m1']/iref", "i1"}, E_OK},
+    {"BOUNDED value-keyed count(), a counted node is given the value of the node",
+        GP_T(GP_U("u1", "t") GP_U("u2", "o") GP_G("g1", "<cq>t</cq>")), {GP_P "u[name='u2']/tag", "t"}, E_BAD},
+    {"BOUNDED value-keyed count(), a counted node is given another value",
+        GP_T(GP_U("u1", "t") GP_U("u2", "o") GP_G("g1", "<cq>t</cq>")), {GP_P "u[name='u2']/tag", "p"}, E_OK},
+    /* the count has an upper bound, so taking a counted node away can only help: no edit of this action can fail */
+    {"BOUNDED value-keyed count(), a counted node is deleted",
+        GP_T(GP_U("u1", "t") GP_U("u2", "o") GP_G("g1", "<cq>t</cq>")), {"-" GP_P "u[name='u2']"}, E_OK},
+};
+
+static void
+test_ref_shapes(void **state)
+{
+    dl_run(state, dl_ref_cases, sizeof dl_ref_cases / sizeof *dl_ref_cases);
+}
+
 static void
 test_del_yang_probe(void **state)
 {
@@ -4223,6 +4418,8 @@ main(void)
         UTEST(test_modify_rules),
         UTEST(test_product_shapes),
         UTEST(test_gap_shapes),
+        UTEST(test_xmod_when_shapes),
+        UTEST(test_ref_shapes),
         UTEST(test_stale_default_unrelated),
     };
 
