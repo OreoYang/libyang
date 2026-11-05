@@ -56,6 +56,8 @@ struct lyd_val_incr {
                                      see ::lyd_val_incr_shallow_ok(); they and their ancestors are in the path */
     struct ly_set extra;        /**< individual nodes outside the scope whose cross-instance constraints
                                      the edit could have changed */
+    struct ly_set required;     /**< parents outside the scope whose absent children the edit could have made
+                                     required, see ::lyd_val_incr_required_wanted() */
     struct ly_set created;      /**< schema nodes the edit only created */
     struct ly_set modified;     /**< schema nodes the edit deleted or whose value it replaced */
     struct lyd_val_incr_valset *valsets;    /**< edited values of every value-keyed node the edit touched */
@@ -83,6 +85,7 @@ lyd_val_incr_erase(struct lyd_val_incr *incr)
     ly_set_erase(&incr->path, NULL);
     ly_set_erase(&incr->shallow, NULL);
     ly_set_erase(&incr->extra, NULL);
+    ly_set_erase(&incr->required, NULL);
     ly_set_erase(&incr->created, NULL);
     ly_set_erase(&incr->modified, NULL);
     lyd_val_incr_valsets_erase(incr);
@@ -653,6 +656,60 @@ lyd_val_incr_dflt_appears(const struct lyd_val_dep_index *index, const struct ly
 }
 
 /**
+ * @brief Whether a node is required while it is absent, its "when" deciding if the requirement holds.
+ */
+static ly_bool
+lyd_val_incr_required(const struct lysc_node *snode)
+{
+    if (snode->nodetype == LYS_LIST) {
+        return ((const struct lysc_node_list *)snode)->min ? 1 : 0;
+    }
+    if (snode->nodetype == LYS_LEAFLIST) {
+        return ((const struct lysc_node_leaflist *)snode)->min ? 1 : 0;
+    }
+    return (snode->flags & LYS_MAND_TRUE) ? 1 : 0;
+}
+
+/**
+ * @brief Collect the data parents of nodes the edit can make required in an instance the scoped passes never reach.
+ *
+ * Mandatory nodes and min-elements are checked while the node is absent, against its "when". A cross-instance "when"
+ * that reads what the edit touched can turn true in a list instance off the scope path, and an absent node has no
+ * instance the extra node search could find, so its parents have to be checked instead.
+ */
+static LY_ERR
+lyd_val_incr_required_wanted(const struct lyd_val_dep_index *index, const struct lyd_val_incr *incr,
+        uint32_t val_opts, struct ly_set *wanted)
+{
+    const struct lyd_val_constraint *cons;
+    const struct lysc_node *parent, *iter;
+    uint32_t i;
+
+    for (i = 0; i < index->nonlocal_count; ++i) {
+        cons = &index->constraints[index->nonlocal[i]];
+        if ((cons->kind != LYD_VAL_DEP_WHEN) || !lyd_val_incr_required(cons->snode)) {
+            continue;
+        }
+        if ((val_opts & LYD_VALIDATE_NO_STATE) && (cons->snode->flags & LYS_CONFIG_R)) {
+            /* state data are not checked for existence */
+            continue;
+        }
+        parent = lysc_data_parent(cons->snode);
+        for (iter = parent; iter && (iter->nodetype != LYS_LIST); iter = lysc_data_parent(iter)) {}
+        if (!iter) {
+            /* no list instance above can be skipped, the final pass reaches the parent */
+            continue;
+        }
+        if (cons->atoms && cons->atoms[0] && !lyd_val_incr_atoms_hit(cons, &incr->modified) &&
+                !lyd_val_incr_atoms_hit(cons, &incr->created)) {
+            continue;
+        }
+        LY_CHECK_RET(ly_set_add(wanted, (void *)parent, 0, NULL));
+    }
+    return LY_SUCCESS;
+}
+
+/**
  * @brief Collect the schema nodes whose cross-instance constraints the edit could have changed.
  */
 static LY_ERR
@@ -701,7 +758,7 @@ lyd_val_incr_wanted_path(const struct ly_set *wanted, struct ly_set *path)
  */
 static LY_ERR
 lyd_val_incr_extra(const struct lyd_node *tree, const struct lys_module *mod, const struct ly_set *wanted,
-        const struct ly_set *wanted_path, struct lyd_val_incr *incr)
+        const struct ly_set *wanted_path, struct lyd_val_incr *incr, struct ly_set *found)
 {
     const struct lyd_node *first, *sibling, *elem;
 
@@ -719,7 +776,7 @@ lyd_val_incr_extra(const struct lyd_node *tree, const struct lys_module *mod, co
             } else if (ly_set_contains(wanted, (void *)elem->schema, NULL) &&
                     !ly_set_contains(&incr->roots, (void *)elem, NULL)) {
                 /* the walk meets every node once */
-                LY_CHECK_RET(ly_set_add(&incr->extra, (void *)elem, 1, NULL));
+                LY_CHECK_RET(ly_set_add(found, (void *)elem, 1, NULL));
             }
             LYD_TREE_DFS_END(sibling, elem);
         }
@@ -744,6 +801,41 @@ lyd_val_incr_prune_extra(struct lyd_val_incr *incr)
                 ly_set_rm_index(&incr->extra, i, NULL);
                 break;
             }
+        }
+    }
+}
+
+/**
+ * @brief Whether the scoped final pass checks the children of a node, every list instance above it being
+ * on the scope path or inside a scope root.
+ */
+static ly_bool
+lyd_val_incr_final_reaches(const struct lyd_val_incr *incr, const struct lyd_node *node)
+{
+    for ( ; node; node = lyd_parent(node)) {
+        if (ly_set_contains(&incr->roots, (void *)node, NULL)) {
+            return 1;
+        }
+        if (node->schema && (node->schema->nodetype & (LYS_LIST | LYS_LEAFLIST)) &&
+                !ly_set_contains(&incr->path, (void *)node, NULL)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/**
+ * @brief Drop required parents whose children the scoped final pass checks anyway.
+ */
+static void
+lyd_val_incr_prune_required(struct lyd_val_incr *incr)
+{
+    uint32_t i = incr->required.count;
+
+    while (i) {
+        --i;
+        if (lyd_val_incr_final_reaches(incr, incr->required.dnodes[i])) {
+            ly_set_rm_index(&incr->required, i, NULL);
         }
     }
 }
@@ -795,13 +887,15 @@ lyd_val_incr_analyze(const struct lyd_node *tree, const struct lys_module *mod, 
  * node this looks for.
  */
 static LY_ERR
-lyd_val_incr_analyze_extra(const struct lyd_node *tree, const struct lys_module *mod, struct lyd_val_incr *incr)
+lyd_val_incr_analyze_extra(const struct lyd_node *tree, const struct lys_module *mod, uint32_t val_opts,
+        struct lyd_val_incr *incr)
 {
     const struct lyd_val_dep_index *index;
     struct ly_set wanted = {0}, wanted_path = {0};
     LY_ERR rc;
 
     ly_set_erase(&incr->extra, NULL);
+    ly_set_erase(&incr->required, NULL);
 
     rc = lyd_val_deps_get(mod, &index);
     if (rc) {
@@ -816,9 +910,23 @@ lyd_val_incr_analyze_extra(const struct lyd_node *tree, const struct lys_module 
         rc = lyd_val_incr_wanted_path(&wanted, &wanted_path);
         LY_CHECK_GOTO(rc, cleanup);
 
-        rc = lyd_val_incr_extra(tree, mod, &wanted, &wanted_path, incr);
+        rc = lyd_val_incr_extra(tree, mod, &wanted, &wanted_path, incr, &incr->extra);
         LY_CHECK_GOTO(rc, cleanup);
         lyd_val_incr_prune_extra(incr);
+    }
+
+    ly_set_erase(&wanted, NULL);
+    ly_set_erase(&wanted_path, NULL);
+    rc = lyd_val_incr_required_wanted(index, incr, val_opts, &wanted);
+    LY_CHECK_GOTO(rc, cleanup);
+
+    if (wanted.count) {
+        rc = lyd_val_incr_wanted_path(&wanted, &wanted_path);
+        LY_CHECK_GOTO(rc, cleanup);
+
+        rc = lyd_val_incr_extra(tree, mod, &wanted, &wanted_path, incr, &incr->required);
+        LY_CHECK_GOTO(rc, cleanup);
+        lyd_val_incr_prune_required(incr);
     }
 
 cleanup:
@@ -1268,7 +1376,7 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
     }
 
     /* the tree stops changing shape here, so the out-of-scope nodes to recheck can finally be looked up */
-    r = lyd_val_incr_analyze_extra(*tree, module, &incr);
+    r = lyd_val_incr_analyze_extra(*tree, module, val_opts, &incr);
     LY_CHECK_ERR_GOTO(r, rc = r, cleanup);
 
     r = lyd_val_incr_unres_extra(&incr, &node_when, &node_types);
@@ -1288,7 +1396,7 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
 
     if (!(val_opts & LYD_VALIDATE_NOT_FINAL)) {
         /* "when" resolution above autodeletes, the extra nodes have to be looked up once more */
-        r = lyd_val_incr_analyze_extra(*tree, module, &incr);
+        r = lyd_val_incr_analyze_extra(*tree, module, val_opts, &incr);
         LY_CHECK_ERR_GOTO(r, rc = r, cleanup);
 
         scope.roots = &incr.roots;
@@ -1299,6 +1407,13 @@ lyd_validate_module_incr(struct lyd_node **tree, const struct lys_module *module
 
         for (i = 0; i < incr.extra.count; ++i) {
             r = lyd_validate_must(incr.extra.dnodes[i], val_opts, 0, 0, &incr);
+            LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
+        }
+
+        for (i = 0; i < incr.required.count; ++i) {
+            iter = incr.required.dnodes[i];
+            r = lyd_validate_siblings_schema_r(lyd_child(iter), iter, iter->schema, NULL, NULL, val_opts, 0,
+                    getnext_ht);
             LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
         }
     }
@@ -1342,7 +1457,7 @@ lyd_validate_module_incr_final(struct lyd_node *tree, const struct lys_module *m
     LY_CHECK_GOTO(rc, cleanup);
 
     if (!incr.fallback) {
-        rc = lyd_val_incr_analyze_extra(tree, module, &incr);
+        rc = lyd_val_incr_analyze_extra(tree, module, val_opts, &incr);
         LY_CHECK_GOTO(rc, cleanup);
     }
     if (incr.fallback) {
@@ -1364,6 +1479,12 @@ lyd_validate_module_incr_final(struct lyd_node *tree, const struct lys_module *m
 
     for (i = 0; i < incr.extra.count; ++i) {
         r = lyd_validate_must(incr.extra.dnodes[i], val_opts, 0, 0, &incr);
+        LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
+    }
+
+    for (i = 0; i < incr.required.count; ++i) {
+        r = lyd_validate_siblings_schema_r(lyd_child(incr.required.dnodes[i]), incr.required.dnodes[i],
+                incr.required.dnodes[i]->schema, NULL, NULL, val_opts, 0, getnext_ht);
         LY_VAL_ERR_GOTO(r, rc = r, val_opts, cleanup);
     }
 

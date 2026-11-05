@@ -119,6 +119,9 @@ static char edit_log[4096];
 /** @brief NULL-terminated names of the modules check_same() validates, at most 4 */
 static const char *check_mods[5] = {"a", NULL, NULL, NULL, NULL};
 
+/** @brief validation options added to the full and to every incremental run of check_same(), like sysrepo's NO_STATE */
+static uint32_t check_val_opts;
+
 /** @brief extra options of every incremental run of check_same(), each one compared against the full run */
 static const uint32_t incr_opt_sets[] = {0, LYD_VALIDATE_INCR_SHALLOW_DELETE};
 
@@ -222,10 +225,10 @@ check_same(void **state, const struct lyd_node *before, const struct lyd_node *a
     /* every module is validated, like sysrepo does for each module an edit may reach */
     rc_full = LY_SUCCESS;
     for (i = 0; !rc_full && (i < mod_count); ++i) {
-        rc_full = lyd_validate_module(&full, mods[i], LYD_VALIDATE_NOT_FINAL, NULL);
+        rc_full = lyd_validate_module(&full, mods[i], LYD_VALIDATE_NOT_FINAL | check_val_opts, NULL);
     }
     for (i = 0; !rc_full && (i < mod_count); ++i) {
-        rc_full = lyd_validate_module_final(full, mods[i], 0);
+        rc_full = lyd_validate_module_final(full, mods[i], check_val_opts);
     }
     snprintf(full_msg, sizeof full_msg, "%s", ly_err_last(UTEST_LYCTX) ? ly_err_last(UTEST_LYCTX)->msg : "-");
     cover_report(before, after, full, rc_full, full_msg, ly_err_last(UTEST_LYCTX) ? ly_err_last(UTEST_LYCTX)->data_path : NULL);
@@ -235,7 +238,7 @@ check_same(void **state, const struct lyd_node *before, const struct lyd_node *a
     }
 
     for (s = 0; s < sizeof incr_opt_sets / sizeof *incr_opt_sets; ++s) {
-    opts = incr_opt_sets[s];
+    opts = incr_opt_sets[s] | check_val_opts;
     self_deleted = 0;
     lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fallbacks_before);
     assert_int_equal(LY_SUCCESS, lyd_diff_siblings(before, after, 0, &diff));
@@ -343,7 +346,9 @@ parse_valid(void **state, const char *xml)
 {
     struct lyd_node *tree = NULL;
 
-    assert_int_equal(LY_SUCCESS, lyd_parse_data_mem(UTEST_LYCTX, xml, LYD_XML, 0, LYD_VALIDATE_PRESENT, &tree));
+    /* the starting data is validated like the edited one, with NO_STATE it holds no state container either */
+    assert_int_equal(LY_SUCCESS, lyd_parse_data_mem(UTEST_LYCTX, xml, LYD_XML, 0,
+            LYD_VALIDATE_PRESENT | check_val_opts, &tree));
     assert_non_null(tree);
     return tree;
 }
@@ -987,6 +992,306 @@ test_dflt_when_remote(void **state)
     lyd_free_siblings(before);
 
     check_mods[0] = "a";
+}
+
+static const char *schema_mw =
+        "module mw {\n"
+        "    namespace urn:tests:mw;\n"
+        "    prefix mw;\n"
+        "    yang-version 1.1;\n"
+        "\n"
+        "    container profs {\n"
+        "        list prof {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf kind { type string; }\n"
+        "        }\n"
+        "    }\n"
+        "    container ifs {\n"
+        "        list if {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            leaf pref { type string; }\n"
+        /* the shape of bbf-frame-processing-profiles tag-0/vlan-id: mandatory only while a profile picked by key
+         * says so */
+        "            container tag {\n"
+        "                leaf vid {\n"
+        "                    when \"/mw:profs/mw:prof[mw:name = current()/../../mw:pref]/mw:kind = 'tagged'\";\n"
+        "                    mandatory true;\n"
+        "                    type uint16;\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "}";
+
+/**
+ * @brief A mandatory node with a cross-instance when is checked while it is absent, so no instance of it can be
+ * scheduled for a recheck when the edit turns the when true in a list instance it did not touch.
+ */
+static void
+test_mandatory_when_remote(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(schema_mw, LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "mw";
+
+    before = parse_valid(state, "<profs xmlns=\"urn:tests:mw\"><prof><name>p1</name><kind>plain</kind></prof>"
+            "<prof><name>p2</name><kind>tagged</kind></prof></profs>"
+            "<ifs xmlns=\"urn:tests:mw\"><if><name>i1</name><pref>p1</pref></if>"
+            "<if><name>i2</name><pref>p2</pref><tag><vid>10</vid></tag></if></ifs>");
+
+    /* the edit is inside the interface, its own subtree holds the mandatory node */
+    check_edit(state, before, "/mw:ifs/if[name='i1']/pref", "p2", LY_EVALID);
+    check_edit(state, before, "/mw:ifs/if[name='i1']/tag/vid", "5", LY_EVALID);
+
+    /* the edit is in the profile, i1 is never touched and now misses vid */
+    check_edit(state, before, "/mw:profs/prof[name='p1']/kind", "tagged", LY_EVALID);
+
+    /* the profile i2 uses stops asking for vid, i2 keeps its vid and the when drops it */
+    check_edit(state, before, "/mw:profs/prof[name='p2']/kind", "plain", LY_SUCCESS);
+
+    lyd_free_siblings(before);
+    check_mods[0] = "a";
+}
+
+/* the shape of test_mandatory_when_remote with the mandatory node varied: a profile picked by key decides whether
+ * a node of the interface is required, and the interface the edit does not touch never gets scheduled */
+#define MP_HEAD \
+        "module mp {\n" \
+        "    namespace urn:tests:mp;\n" \
+        "    prefix mp;\n" \
+        "    yang-version 1.1;\n" \
+        "    container profs { list prof { key name; leaf name { type string; } leaf kind { type string; } } }\n"
+#define MP_IF_OPEN \
+        "    container ifs { list if { key name; leaf name { type string; } leaf pref { type string; }\n"
+#define MP_TAGGED(UP) \
+        "/mp:profs/mp:prof[mp:name = current()/" UP "mp:pref]/mp:kind = 'tagged'"
+#define MP_PROFS_XML \
+        "<profs xmlns=\"urn:tests:mp\"><prof><name>p1</name><kind>plain</kind></prof></profs>"
+#define MP_IFS_XML(IFS) \
+        "<ifs xmlns=\"urn:tests:mp\">" IFS "</ifs>"
+#define MP_IF_I1 \
+        "<if><name>i1</name><pref>p1</pref></if>"
+
+/** @brief a profile is created, an interface that was never edited already names it */
+static void
+test_required_when_created(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(MP_HEAD MP_IF_OPEN
+            "      container tag { leaf vid { when \"" MP_TAGGED("../../") "\"; mandatory true; type uint16; } }\n"
+            "    } }\n}", LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "mp";
+
+    before = parse_valid(state, MP_PROFS_XML MP_IFS_XML("<if><name>i1</name><pref>p3</pref></if>"));
+    check_edit(state, before, "/mp:profs/prof[name='p3']/kind", "tagged", LY_EVALID);
+
+    lyd_free_siblings(before);
+}
+
+/** @brief a profile is deleted, a when reading it through not() turns true */
+static void
+test_required_when_deleted(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(MP_HEAD MP_IF_OPEN
+            "      container tag { leaf vid { when \"not(/mp:profs/mp:prof[mp:name = current()/../../mp:pref])\";"
+            " mandatory true; type uint16; } }\n"
+            "    } }\n}", LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "mp";
+
+    before = parse_valid(state, MP_PROFS_XML MP_IFS_XML(MP_IF_I1));
+    check_delete(state, before, "/mp:profs/prof[name='p1']", LY_EVALID);
+
+    lyd_free_siblings(before);
+}
+
+/** @brief min-elements of a leaf-list is required while the node is absent, just like mandatory */
+static void
+test_required_when_min_elements(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(MP_HEAD MP_IF_OPEN
+            "      container tag { leaf-list vids { when \"" MP_TAGGED("../../") "\"; min-elements 1; type uint16; } }\n"
+            "    } }\n}", LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "mp";
+
+    before = parse_valid(state, MP_PROFS_XML MP_IFS_XML(MP_IF_I1));
+    check_edit(state, before, "/mp:profs/prof[name='p1']/kind", "tagged", LY_EVALID);
+
+    lyd_free_siblings(before);
+}
+
+/** @brief the required node is a mandatory choice and the when sits on the choice */
+static void
+test_required_when_choice(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(MP_HEAD MP_IF_OPEN
+            "      choice c { when \"" MP_TAGGED("") "\"; mandatory true;"
+            " leaf a { type string; } leaf b { type string; } }\n"
+            "    } }\n}", LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "mp";
+
+    before = parse_valid(state, MP_PROFS_XML MP_IFS_XML(MP_IF_I1));
+    check_edit(state, before, "/mp:profs/prof[name='p1']/kind", "tagged", LY_EVALID);
+
+    lyd_free_siblings(before);
+}
+
+/** @brief the parent of the required node is a nested list, every row of it has to be checked */
+static void
+test_required_when_nested_list(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(MP_HEAD MP_IF_OPEN
+            "      list sub { key id; leaf id { type uint8; }\n"
+            "        leaf v { when \"" MP_TAGGED("../../") "\"; mandatory true; type uint16; } }\n"
+            "    } }\n}", LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "mp";
+
+    before = parse_valid(state, MP_PROFS_XML MP_IFS_XML("<if><name>i1</name><pref>p1</pref>"
+            "<sub><id>1</id></sub><sub><id>2</id></sub></if>"));
+    check_edit(state, before, "/mp:profs/prof[name='p1']/kind", "tagged", LY_EVALID);
+
+    lyd_free_siblings(before);
+}
+
+/** @brief the edit is in one module and the required node in another, both validated like sysrepo does */
+static void
+test_required_when_cross_module(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE("module pxa {\n"
+            "    namespace urn:tests:pxa;\n"
+            "    prefix pxa;\n"
+            "    container profs { list prof { key name; leaf name { type string; } leaf kind { type string; } } }\n"
+            "}", LYS_IN_YANG, NULL, NULL);
+    UTEST_ADD_MODULE("module pxb {\n"
+            "    namespace urn:tests:pxb;\n"
+            "    prefix pxb;\n"
+            "    yang-version 1.1;\n"
+            "    import pxa { prefix pxa; }\n"
+            "    container ifs { list if { key name; leaf name { type string; } leaf pref { type string; }\n"
+            "      container tag { leaf vid {\n"
+            "        when \"/pxa:profs/pxa:prof[pxa:name = current()/../../pxb:pref]/pxa:kind = 'tagged'\";\n"
+            "        mandatory true; type uint16; } }\n"
+            "    } }\n}", LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "pxa";
+    check_mods[1] = "pxb";
+
+    before = parse_valid(state, "<profs xmlns=\"urn:tests:pxa\"><prof><name>p1</name><kind>plain</kind></prof></profs>"
+            "<ifs xmlns=\"urn:tests:pxb\"><if><name>i1</name><pref>p1</pref></if></ifs>");
+    check_edit(state, before, "/pxa:profs/prof[name='p1']/kind", "tagged", LY_EVALID);
+
+    lyd_free_siblings(before);
+}
+
+/** @brief an interface the edit touches next to one it does not, only the untouched one is out of scope */
+static void
+test_required_when_two_instances(void **state)
+{
+    struct lyd_node *before, *after = NULL;
+    LY_ERR rc;
+
+    UTEST_ADD_MODULE(MP_HEAD MP_IF_OPEN
+            "      container tag { leaf vid { when \"" MP_TAGGED("../../") "\"; mandatory true; type uint16; } }\n"
+            "    } }\n}", LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "mp";
+
+    before = parse_valid(state, MP_PROFS_XML MP_IFS_XML(MP_IF_I1 "<if><name>i2</name><pref>p1</pref></if>"));
+
+    /* vid while the profile is plain: its own when is false */
+    check_edit(state, before, "/mp:ifs/if[name='i1']/tag/vid", "1", LY_EVALID);
+
+    /* both interfaces need vid, i1 gets it and i2 is the one nothing touched */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, "/mp:profs/prof[name='p1']/kind", "tagged",
+            LYD_NEW_PATH_UPDATE, NULL));
+    assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, "/mp:ifs/if[name='i1']/tag/vid", "1",
+            LYD_NEW_PATH_UPDATE, NULL));
+    check_same(state, before, after, 0, &rc);
+    assert_int_equal(LY_EVALID, rc);
+
+    /* and once i2 has it too, nothing is missing */
+    assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, "/mp:ifs/if[name='i2']/tag/vid", "2",
+            LYD_NEW_PATH_UPDATE, NULL));
+    check_same(state, before, after, 0, &rc);
+    assert_int_equal(LY_SUCCESS, rc);
+
+    lyd_free_siblings(after);
+    lyd_free_siblings(before);
+}
+
+/** @brief a mandatory node that is state is rejected when state is validated */
+static void
+test_required_when_state(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(MP_HEAD MP_IF_OPEN
+            "      container st { config false;\n"
+            "        leaf vid { when \"" MP_TAGGED("../../") "\"; mandatory true; type uint16; } }\n"
+            "    } }\n}", LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "mp";
+
+    before = parse_valid(state, MP_PROFS_XML MP_IFS_XML(MP_IF_I1));
+    check_edit(state, before, "/mp:profs/prof[name='p1']/kind", "tagged", LY_EVALID);
+
+    lyd_free_siblings(before);
+}
+
+/**
+ * @brief sysrepo validates running data with NO_STATE, a state node is never required there.
+ *
+ * Both validators have to accept: the node is not checked at all, so the edit that would make it required in
+ * state data must not make the incremental pass reject.
+ */
+static void
+test_required_when_no_state(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(MP_HEAD MP_IF_OPEN
+            "      container st { config false;\n"
+            "        leaf vid { when \"" MP_TAGGED("../../") "\"; mandatory true; type uint16; } }\n"
+            "    } }\n}", LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "mp";
+    check_val_opts = LYD_VALIDATE_NO_STATE;
+
+    before = parse_valid(state, MP_PROFS_XML MP_IFS_XML(MP_IF_I1));
+    check_edit(state, before, "/mp:profs/prof[name='p1']/kind", "tagged", LY_SUCCESS);
+
+    lyd_free_siblings(before);
+}
+
+/** @brief NO_STATE only drops the state nodes: a configuration node next to one is still required */
+static void
+test_required_when_no_state_config(void **state)
+{
+    struct lyd_node *before;
+
+    UTEST_ADD_MODULE(MP_HEAD MP_IF_OPEN
+            "      container st { config false;\n"
+            "        leaf vid { when \"" MP_TAGGED("../../") "\"; mandatory true; type uint16; } }\n"
+            "      container tag {\n"
+            "        leaf vid { when \"" MP_TAGGED("../../") "\"; mandatory true; type uint16; } }\n"
+            "    } }\n}", LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "mp";
+    check_val_opts = LYD_VALIDATE_NO_STATE;
+
+    before = parse_valid(state, MP_PROFS_XML MP_IFS_XML(MP_IF_I1));
+    check_edit(state, before, "/mp:profs/prof[name='p1']/kind", "tagged", LY_EVALID);
+
+    lyd_free_siblings(before);
 }
 
 /**
@@ -3839,6 +4144,26 @@ test_del_sweep_by_reader(void **state)
     dl_done();
 }
 
+/**
+ * @brief Setup of every test: forget what the previous one chose to validate.
+ *
+ * A test picks its modules and options in globals and puts them back at its end, which a failed assertion skips.
+ * Without this the next test validates modules that do not exist in its context and fails for that reason alone,
+ * hiding what the first failure was.
+ */
+static int
+reset_check_state(void **state)
+{
+    check_mods[0] = "a";
+    check_mods[1] = check_mods[2] = check_mods[3] = check_mods[4] = NULL;
+    check_val_opts = 0;
+
+    return utest_setup(state);
+}
+
+#undef UTEST
+#define UTEST(FUNC) cmocka_unit_test_setup_teardown(FUNC, reset_check_state, utest_teardown)
+
 int
 main(void)
 {
@@ -3857,6 +4182,17 @@ main(void)
         UTEST(test_toplevel_default),
         UTEST(test_stale_default),
         UTEST(test_dflt_when_remote),
+        UTEST(test_mandatory_when_remote),
+        UTEST(test_required_when_created),
+        UTEST(test_required_when_deleted),
+        UTEST(test_required_when_min_elements),
+        UTEST(test_required_when_choice),
+        UTEST(test_required_when_nested_list),
+        UTEST(test_required_when_cross_module),
+        UTEST(test_required_when_two_instances),
+        UTEST(test_required_when_state),
+        UTEST(test_required_when_no_state),
+        UTEST(test_required_when_no_state_config),
         UTEST(test_stats),
         UTEST(test_shallow_delete),
         UTEST(test_shallow_gate),
