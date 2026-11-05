@@ -1379,6 +1379,30 @@ static const char *schema_sd =
         "        must \"true()\";\n"
         "        list item { key name; leaf name { type string; } }\n"
         "    }\n"
+        "\n"
+        /* a rule with no atoms nested two lists deep, like server-authentication of a transport profile: the nodes the
+         * rule names are behind a feature that is off, so they are not in the schema and the rule reads nothing known.
+         * auth is a presence container, a non-presence one is created in every instance and fails the rule there */
+        "    feature off;\n"
+        "    container lprof {\n"
+        "        list tp {\n"
+        "            key name;\n"
+        "            leaf name { type string; }\n"
+        "            list transport {\n"
+        "                key name;\n"
+        "                leaf name { type string; }\n"
+        "                container tls {\n"
+        "                    leaf x { type string; }\n"
+        "                    container auth {\n"
+        "                        presence \"p\";\n"
+        "                        must \"ca or ee\";\n"
+        "                        container ca { if-feature off; presence \"p\"; }\n"
+        "                        container ee { if-feature off; presence \"p\"; }\n"
+        "                    }\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
         "}";
 
 static const char *sd_xml =
@@ -1391,7 +1415,10 @@ static const char *sd_xml =
         "</top>"
         "<counted xmlns=\"urn:tests:sd\"><item><name>c1</name></item><item><name>c2</name></item>"
         "  <item><name>c3</name></item></counted>"
-        "<blind xmlns=\"urn:tests:sd\"><item><name>b1</name></item><item><name>b2</name></item></blind>";
+        "<blind xmlns=\"urn:tests:sd\"><item><name>b1</name></item><item><name>b2</name></item></blind>"
+        "<lprof xmlns=\"urn:tests:sd\">"
+        "  <tp><name>t1</name><transport><name>a</name><tls><x>1</x></tls></transport></tp>"
+        "  <tp><name>t2</name><transport><name>a</name><tls><x>2</x></tls></transport></tp></lprof>";
 
 /**
  * @brief Delete a node both ways, see check_delete(), and require the narrow scope to be taken or not.
@@ -1441,6 +1468,9 @@ test_shallow_delete(void **state)
     /* a rule of the parent container itself and a rule with no atoms keep the wide scope */
     check_delete_shallow(state, before, "/sd:counted/item[name='c3']", LY_SUCCESS, 0);
     check_delete_shallow(state, before, "/sd:blind/item[name='b2']", LY_SUCCESS, 0);
+
+    /* a rule with no atoms inside a list instance does not keep the wide scope */
+    check_delete_shallow(state, before, "/sd:lprof/tp[name='t2']", LY_SUCCESS, 1);
 
     lyd_free_siblings(before);
 

@@ -427,7 +427,9 @@ lyd_val_incr_add_root(struct lyd_val_incr *incr, struct lyd_node *root)
  * sibling instances. A rule in a sibling instance that reads the deleted one crosses a list instance that nothing
  * confines, so the classifier made it cross-instance and the extra node search rechecks it. A rule outside every
  * list that reads anything in the deleted subtree has its atoms in the top-level atoms, and a rule whose atoms are
- * unknown is not found by the extra node search at all; both keep the wide scope. The parent stays on the path, so
+ * unknown is not found by the extra node search at all; both keep the wide scope. A local rule confined to a list
+ * instance is the exception: with no list above the parent, that instance is the deleted one or a sibling of it, and
+ * the rule reads nothing outside of it, like every local rule the scoped passes skip. The parent stays on the path, so
  * its own conditions and the number of instances are still checked by the final pass.
  *
  * @param[in] index Dependency index of the validated module.
@@ -464,6 +466,7 @@ lyd_val_incr_shallow_ok(const struct lyd_val_dep_index *index, const struct lyd_
     for (i = 0; i < index->constraint_count; ++i) {
         cons = &index->constraints[i];
         if ((cons->kind != LYD_VAL_DEP_UNIQUE) && (!cons->atoms || !cons->atoms[0]) &&
+                !((cons->cls == LYD_VAL_DEP_LOCAL) && cons->unit) &&
                 lyd_val_incr_snode_covers(parent->schema, cons->snode)) {
             return 0;
         }
