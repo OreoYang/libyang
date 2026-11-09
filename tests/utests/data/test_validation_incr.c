@@ -3496,6 +3496,22 @@ static const struct dl_case dl_add_cases[] = {
         "<un><name>c</name></un>"), {"/dl:c-neg/un[name='d']", NULL}, E_BAD},
     {"add: structure, unique value twice", DL_C("c-neg", "<un><name>a</name><u>1</u></un>"),
         {"/dl:c-neg/un[name='b']/u", "1"}, E_BAD},
+    {"add: structure, max-elements of a list, at the limit", DL_C("c-neg", "<un><name>a</name></un><un><name>b</name></un>"),
+        {"/dl:c-neg/un[name='c']", NULL}, E_OK},
+    {"add: structure, max-elements of a leaf-list", DL_C("c-neg", "<mx>a</mx><mx>b</mx><mx>c</mx>"),
+        {"/dl:c-neg/mx[.='d']", NULL}, E_BAD},
+    {"add: structure, unique value is distinct", DL_C("c-neg", "<un><name>a</name><u>1</u></un>"),
+        {"/dl:c-neg/un[name='b']/u", "2"}, E_OK},
+    {"add: structure, mandatory leaf missing", DL_T(DL_I("i1", "a")), {"/dl:c-mp/l[name='a']", NULL}, E_BAD},
+    {"add: structure, mandatory leaf present", DL_T(DL_I("i1", "a")), {"/dl:c-mp/m", "x", "/dl:c-mp/l[name='a']", NULL}, E_OK},
+    {"add: structure, mandatory choice without a case", DL_T(DL_I("i1", "a")), {"/dl:c-mc/keep", "x"}, E_BAD},
+    {"add: structure, mandatory choice with a case", DL_T(DL_I("i1", "a")), {"/dl:c-mc/lb", "v"}, E_OK},
+    {"add: structure, min-elements too few", DL_T(DL_I("i1", "a")), {"/dl:c-mn/mn[name='a']", NULL}, E_BAD},
+    {"add: structure, min-elements enough", DL_T(DL_I("i1", "a")),
+        {"/dl:c-mn/mn[name='a']", NULL, "/dl:c-mn/mn[name='b']", NULL}, E_OK},
+    {"add: structure, min-elements of a leaf-list", DL_T(DL_I("i1", "a")), {"/dl:c-mt/keep", "x"}, E_BAD},
+    {"add: structure, default case gives way to the added one", DL_C("c-dc", "<keep>k</keep>"),
+        {"/dl:c-dc/rule[id='1']", NULL}, E_OK},
     /* CASCADE */
     {"add: CASCADE the when turns false, the node goes", DL_T(DL_G1 "<wn>y</wn></grp>"
         "<grp><name>g2</name><mem><name>a</name></mem></grp>"), {DL_P "grp[name='g2']/mem[name='w1']", NULL}, E_OK},
@@ -3556,6 +3572,19 @@ static const struct dl_case dl_modify_cases[] = {
         DL_T(DL_R("r", "<sw>on</sw><dep>x</dep><m-dep>y</m-dep>")), {DL_P "r[name='r']/sw", "off"}, E_BAD},
     {"modify: CASCADE the when turns false, the node is dropped, nothing reads it",
         DL_T(DL_R("r", "<sw>on</sw><dep>x</dep>")), {DL_P "r[name='r']/sw", "off"}, E_OK},
+    /* STRUCTURE */
+    {"modify: structure, unique value becomes a duplicate",
+        DL_C("c-neg", "<un><name>a</name><u>1</u></un><un><name>b</name><u>2</u></un>"),
+        {"/dl:c-neg/un[name='b']/u", "1"}, E_BAD},
+    {"modify: structure, unique value becomes another distinct one",
+        DL_C("c-neg", "<un><name>a</name><u>1</u></un><un><name>b</name><u>2</u></un>"),
+        {"/dl:c-neg/un[name='b']/u", "3"}, E_OK},
+    {"modify: structure, choice case switched, the old case is replaced",
+        DL_C("c-mc", "<la><name>a</name></la>"), {"/dl:c-mc/lb", "v"}, E_OK},
+    {"modify: structure, choice case switched in a default choice",
+        DL_C("c-dc", "<keep>k</keep><auto>x</auto>"), {"/dl:c-dc/rule[id='1']", NULL}, E_OK},
+    {"modify: structure, mandatory leaf value changes",
+        DL_C("c-mp", "<m>x</m>"), {"/dl:c-mp/m", "y"}, E_OK},
 };
 
 /*
@@ -4369,6 +4398,106 @@ test_del_sweep_by_reader(void **state)
     dl_done();
 }
 
+/*
+ * The checks of full validation that no rule of the dependency index and no list or container shape reaches: the
+ * state, obsolete and metadata checks, the duplicate checks, and a diff the analysis cannot read.
+ */
+static const char *schema_sc =
+        "module sc {\n"
+        "    namespace urn:tests:sc;\n"
+        "    prefix sc;\n"
+        "    yang-version 1.1;\n"
+        "    import ietf-yang-metadata { prefix md; }\n"
+        "\n"
+        "    md:annotation lan { type instance-identifier; }\n"
+        "    container c {\n"
+        "        list l { key name; leaf name { type string; } }\n"
+        "        leaf-list ll { type string; }\n"
+        "        choice ch { case x { leaf cx { type string; } } case y { leaf cy { type string; } } }\n"
+        "        leaf ob { type string; status obsolete; }\n"
+        "    }\n"
+        "    container st { config false; leaf v { type string; } }\n"
+        "}";
+
+#define SC_XML "<c xmlns=\"urn:tests:sc\"><l><name>a</name></l><ll>a</ll><cx>x</cx></c>"
+
+/**
+ * @brief Validate @p after against @p before both ways, and require the verdict @p expected.
+ */
+static void
+sc_check(void **state, const struct lyd_node *before, const struct lyd_node *after, LY_ERR expected)
+{
+    LY_ERR rc;
+
+    check_same(state, before, after, 1, &rc);
+    assert_int_equal(expected, rc);
+}
+
+static void
+test_schema_constraints_misc(void **state)
+{
+    struct lyd_node *before, *after, *node, *diff;
+    const struct lys_module *mod;
+    uint64_t fb_before = 0, fb_after = 0;
+
+    UTEST_ADD_MODULE(schema_sc, LYS_IN_YANG, NULL, NULL);
+    check_mods[0] = "sc";
+    before = parse_valid(state, SC_XML);
+
+    /* a second instance of a list with the same keys, which no edit of a datastore can make */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    assert_int_equal(LY_SUCCESS, lyd_find_path(after, "/sc:c", 0, &node));
+    assert_int_equal(LY_SUCCESS, lyd_new_list(node, NULL, "l", 0, NULL, "a"));
+    sc_check(state, before, after, LY_EVALID);
+    lyd_free_siblings(after);
+
+    /* two cases of a choice that are both old, one of them is not the new one that would replace the other */
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    assert_int_equal(LY_SUCCESS, lyd_find_path(after, "/sc:c", 0, &node));
+    assert_int_equal(LY_SUCCESS, lyd_new_term(node, NULL, "cy", "y", 0, &node));
+    node->flags &= ~LYD_NEW;
+    sc_check(state, before, after, LY_EVALID);
+    lyd_free_siblings(after);
+
+    /* the case the edit creates replaces the old one */
+    check_edit(state, before, "/sc:c/cy", "y", LY_SUCCESS);
+
+    /* the type of an annotation that is resolved after the parsing, on a created node: a target that exists, then
+     * one that does not */
+    for (uint32_t i = 0; i < 2; ++i) {
+        assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+        assert_int_equal(LY_SUCCESS, lyd_new_path(after, UTEST_LYCTX, "/sc:c/ll[.='b']", NULL, 0, &node));
+        assert_int_equal(LY_SUCCESS, lyd_new_meta(UTEST_LYCTX, node, NULL, "sc:lan", i ? "/sc:c/ll[.='zz']" : "/sc:c/ll[.='a']", 0, NULL));
+        sc_check(state, before, after, i ? LY_ENOTFOUND : LY_SUCCESS);
+        lyd_free_siblings(after);
+    }
+
+    /* state data in a tree that holds none */
+    check_val_opts = LYD_VALIDATE_NO_STATE;
+    lyd_free_siblings(before);
+    before = parse_valid(state, SC_XML);
+    check_edit(state, before, "/sc:st/v", "x", LY_EVALID);
+    check_edit(state, before, "/sc:c/ll[.='b']", NULL, LY_SUCCESS);
+    check_val_opts = 0;
+
+    /* an obsolete node is only a warning */
+    check_edit(state, before, "/sc:c/ob", "x", LY_SUCCESS);
+
+    /* a diff node without a schema node cannot be classified, so the whole module is validated in full */
+    mod = ly_ctx_get_module_implemented(UTEST_LYCTX, "sc");
+    assert_int_equal(LY_SUCCESS, lyd_new_opaq(NULL, UTEST_LYCTX, "bogus", "v", NULL, "urn:tests:sc", &diff));
+    assert_int_equal(LY_SUCCESS, lyd_new_attr(diff, "yang", "operation", "create", NULL));
+    assert_int_equal(LY_SUCCESS, lyd_dup_siblings(before, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &after));
+    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fb_before);
+    assert_int_equal(LY_SUCCESS, lyd_validate_module_incr(&after, mod, diff, 0, NULL));
+    lyd_validate_incr_stats(UTEST_LYCTX, NULL, &fb_after);
+    assert_int_equal(fb_before + 1, fb_after);
+    lyd_free_all(diff);
+    lyd_free_siblings(after);
+
+    lyd_free_siblings(before);
+}
+
 /**
  * @brief Setup of every test: forget what the previous one chose to validate.
  *
@@ -4451,6 +4580,7 @@ main(void)
         UTEST(test_xmod_when_shapes),
         UTEST(test_ref_shapes),
         UTEST(test_stale_default_unrelated),
+        UTEST(test_schema_constraints_misc),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);
