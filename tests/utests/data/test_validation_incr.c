@@ -3654,6 +3654,70 @@ test_modify_rules(void **state)
 }
 
 /*
+ * A key cannot be modified, so a key change is a delete of the old instance and a create of the new one in the same
+ * edit. Each reader of the old key either is left behind or follows in the same edit.
+ */
+static const struct dl_case dl_key_cases[] = {
+    {"key change of a leafref target, the reader is left behind", DL_T(DL_I("i1", "a") DL_I("i2", "b")
+        DL_R("r", "<lref>i1</lref>")), {"-" DL_P "item[name='i1']", NULL, DL_P "item[name='i9']/val", "a"}, E_BAD},
+    {"key change of a leafref target, the reader follows", DL_T(DL_I("i1", "a") DL_I("i2", "b")
+        DL_R("r", "<lref>i1</lref>")), {"-" DL_P "item[name='i1']", NULL, DL_P "item[name='i9']/val", "a",
+        DL_P "r[name='r']/lref", "i9"}, E_OK},
+    {"key change of an instance no rule reads", DL_T(DL_I("i1", "a") DL_I("i2", "b") DL_R("r", "<lref>i1</lref>")),
+        {"-" DL_P "item[name='i2']", NULL, DL_P "item[name='i9']/val", "b"}, E_OK},
+    {"key change of a leaf-list leafref target", DL_T("<tag>t1</tag><tag>t2</tag>" DL_R("r", "<tref>t1</tref>")),
+        {"-" DL_P "tag[.='t1']", NULL, DL_P "tag[.='t9']", NULL}, E_BAD},
+    {"key change of a list keyed by a leafref, to an existing target", DL_T(DL_I("i1", "a") DL_I("i2", "b")
+        "<kr><k>i1</k></kr>"), {"-" DL_P "kr[k='i1']", NULL, DL_P "kr[k='i2']", NULL}, E_OK},
+    {"key change of a list keyed by a leafref, to a missing target", DL_T(DL_I("i1", "a") DL_I("i2", "b")
+        "<kr><k>i1</k></kr>"), {"-" DL_P "kr[k='i1']", NULL, DL_P "kr[k='i7']", NULL}, E_BAD},
+    {"key change of the target of a leafref key", DL_T(DL_I("i1", "a") "<kr><k>i1</k></kr>"),
+        {"-" DL_P "item[name='i1']", NULL, DL_P "item[name='i9']/val", "a"}, E_BAD},
+    {"key change keeps a unique value", DL_C("c-neg", "<un><name>a</name><u>u1</u></un><un><name>b</name><u>u2</u></un>"),
+        {"-/dl:c-neg/un[name='a']", NULL, "/dl:c-neg/un[name='c']/u", "u1"}, E_OK},
+    {"key change collides on a unique value", DL_C("c-neg", "<un><name>a</name><u>u1</u></un><un><name>b</name><u>u2</u></un>"),
+        {"-/dl:c-neg/un[name='a']", NULL, "/dl:c-neg/un[name='c']/u", "u2"}, E_BAD},
+    {"key change keeps a value-keyed count", DL_C("c-vk", "<vk><name>v1</name><grp>g1</grp></vk>"
+        "<vk><name>v2</name><grp>g1</grp></vk>"), {"-/dl:c-vk/vk[name='v1']", NULL, "/dl:c-vk/vk[name='v9']/grp", "g1"}, E_OK},
+    {"key change moves an instance to another value bucket", DL_C("c-vk", "<vk><name>v1</name><grp>g1</grp></vk>"
+        "<vk><name>v2</name><grp>g1</grp></vk><vk><name>v3</name><grp>g2</grp></vk><vk><name>v4</name><grp>g2</grp></vk>"),
+        {"-/dl:c-vk/vk[name='v1']", NULL, "/dl:c-vk/vk[name='v9']/grp", "g2"}, E_BAD},
+    {"key change of a must target picked by a key predicate", DL_T("<tpl><name>t1</name><comp><name>c1</name>"
+        "<cls>ok</cls></comp><ifc><name>i1</name><hw>c1</hw></ifc></tpl>"), {"-" DL_P "tpl[name='t1']/comp[name='c1']", NULL,
+        DL_P "tpl[name='t1']/comp[name='c9']/cls", "ok"}, E_BAD},
+    {"key change of a must target picked by a key predicate, the reader follows", DL_T("<tpl><name>t1</name><comp>"
+        "<name>c1</name><cls>ok</cls></comp><ifc><name>i1</name><hw>c1</hw></ifc></tpl>"),
+        {"-" DL_P "tpl[name='t1']/comp[name='c1']", NULL, DL_P "tpl[name='t1']/comp[name='c9']/cls", "ok",
+        DL_P "tpl[name='t1']/ifc[name='i1']/hw", "c9"}, E_OK},
+    {"key change of the instance a when reads", DL_T(DL_GATE DL_R("r", "<w-on>y</w-on>")),
+        {"-" DL_P "item[name='gate']", NULL, DL_P "item[name='gat2']", NULL}, E_OK},
+    {"key change of the instance a when reads, a leafref needs the guarded node", DL_T(DL_GATE DL_R("r", "<w-on>y</w-on>")
+        "<wr><name>w1</name><wref>y</wref></wr>"), {"-" DL_P "item[name='gate']", NULL, DL_P "item[name='gat2']", NULL}, E_BAD},
+    {"key change inside a nested list, a not() rule now matches", DL_T(DL_G1 "<nx>y</nx></grp>"
+        "<grp><name>g2</name><mem><name>m1</name></mem></grp>"), {"-" DL_P "grp[name='g2']/mem[name='m1']", NULL,
+        DL_P "grp[name='g2']/mem[name='w1']", NULL}, E_BAD},
+    {"key change inside a nested list, the not() rule still holds", DL_T(DL_G1 "<nx>y</nx></grp>"
+        "<grp><name>g2</name><mem><name>m1</name></mem></grp>"), {"-" DL_P "grp[name='g2']/mem[name='m1']", NULL,
+        DL_P "grp[name='g2']/mem[name='w2']", NULL}, E_OK},
+    {"key change of the list a rule points at by value", DL_T(DL_G1 "<nx>y</nx></grp>"
+        "<grp><name>g2</name><mem><name>m1</name></mem></grp>"), {"-" DL_P "grp[name='g2']", NULL,
+        DL_P "grp[name='g3']/mem[name='w1']", NULL}, E_OK},
+    {"key change of the list a rule points at by value, the pointer follows", DL_T(DL_G1 "<nx>y</nx></grp>"
+        "<grp><name>g2</name><mem><name>m1</name></mem></grp>"), {"-" DL_P "grp[name='g2']", NULL,
+        DL_P "grp[name='g3']/mem[name='w1']", NULL, DL_P "grp[name='g1']/other", "g3"}, E_BAD},
+    {"key change read by another module", DL_T(DL_I("i1", "a") DL_I("i2", "b")) DM_M("<iref>i1</iref>"),
+        {"-" DL_P "item[name='i1']", NULL, DL_P "item[name='i9']/val", "a"}, E_BAD},
+    {"key change read by another module, the reader follows", DL_T(DL_I("i1", "a") DL_I("i2", "b")) DM_M("<iref>i1</iref>"),
+        {"-" DL_P "item[name='i1']", NULL, DL_P "item[name='i9']/val", "a", "/dm:mtop/mr[name='m1']/iref", "i9"}, E_OK},
+};
+
+static void
+test_key_change(void **state)
+{
+    dl_run(state, dl_key_cases, sizeof dl_key_cases / sizeof *dl_key_cases);
+}
+
+/*
  * The rules of the product schema, one shape each. The names are not the product names, the expressions are. Every
  * case is an add or a modify, and the expectation is what full validation says.
  */
@@ -4575,6 +4639,7 @@ main(void)
         UTEST(test_del_yang_probe),
         UTEST(test_add_relative_readers),
         UTEST(test_modify_rules),
+        UTEST(test_key_change),
         UTEST(test_product_shapes),
         UTEST(test_gap_shapes),
         UTEST(test_xmod_when_shapes),
